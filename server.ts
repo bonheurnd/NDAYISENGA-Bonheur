@@ -1,0 +1,6844 @@
+// Ensure tsx runtime __dirname='.' polyfill does not interfere with Vite/Rolldown config loaders and plugins
+if (typeof (globalThis as any).__dirname !== 'undefined' && (globalThis as any).__dirname === '.') {
+  delete (globalThis as any).__dirname;
+}
+
+import express from 'express';
+import helmet from 'helmet';
+import http from 'http';
+import path from 'path';
+import fs from 'fs';
+import { createServer as createViteServer } from 'vite';
+import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
+import multer from 'multer';
+import PDFDocument from 'pdfkit';
+import { db, initDatabase, logActivity, getMomoDonationSettings, updateMomoDonationSettings } from './server/db.js';
+import { createDatabaseBackup } from './scripts/backup-database.js';
+import { syncOfficialDocumentSongs } from './server/officialSongsSync.js';
+import {
+  parseSongDocumentToJSON,
+  upsertSongRecords,
+  parseAndUpsertSongDocument,
+  upsertSongRecord,
+  manageSongRecord,
+  upsertSongByTitle,
+  findExistingSongByTitle,
+  type ParsedSongItem,
+  type SongRecordInput,
+  type ManageSongRecordResult
+} from './server/songDocumentParser.js';
+import { manageSong } from './server/songService.js';
+import {
+  parseSixteenSongs,
+  upsertSixteenSongs,
+  RAW_16_SONGS_DOCUMENT_TEXT
+} from './server/parse16SongsUtility.js';
+import {
+  generateToken,
+  generatePasswordResetToken,
+  verifyPasswordResetToken,
+  verifyToken,
+  requireAuth,
+  requireAdmin,
+  requireSuperAdmin,
+  requireContentAdmin,
+  requireModerator,
+  optionalAuth,
+  isUserAdmin,
+  hashPassword,
+  comparePassword,
+  comparePasswordSync,
+  verifyAdminCredentials,
+  setupFirstAdminAccount,
+  initializeFirstAdminAccount,
+  logAuthDiagnostic,
+  authDiagnosticMiddleware,
+  AuthRequest
+} from './server/auth.js';
+import { initiateRwandaPayment, verifyPaymentTransaction, validateRwandaPhoneNumber } from './server/momo.js';
+import { RwandaPaymentGatewayService, validateAndNormalizeRwandaPhone } from './server/rwandaPaymentGateway.js';
+import { paymentsRouter } from './server/payments.js';
+import { sendPasswordResetEmail, isEmailServiceConfigured, getEmailConfig } from './server/email.js';
+import {
+  getAiAssistantConfig,
+  updateAiAssistantConfig,
+  generateChatResponse,
+  checkRateLimit,
+  searchChoirDatabase,
+  SUPPORTED_MODELS
+} from './server/aiService.js';
+import { aiRouter } from './src/server/routes/ai.js';
+import { exportRouter, getMembersData, getDonationsData, getEventsData, streamCsvResponse } from './server/export.js';
+import { broadcastRealtimeEvent, eventStreamClients } from './server/realtime.js';
+export { broadcastRealtimeEvent };
+import { attendanceRouter } from './server/routes/attendance.js';
+import { announcementsRouter } from './server/routes/announcements.js';
+import { remindersRouter, startReminderScheduler } from './server/routes/reminders.js';
+import { membersRouter } from './server/routes/members.js';
+// @ts-ignore
+import mammoth from 'mammoth';
+
+// Initialize DB schema & seeds
+initDatabase();
+
+const app = express();
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const isProduction = process.env.NODE_ENV === 'production';
+
+// Disable X-Powered-By to prevent technology information disclosure
+app.disable('x-powered-by');
+
+// Register Helmet security middleware early in the Express pipeline
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      useDefaults: false,
+      directives: {
+        defaultSrc: ["'self'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+        objectSrc: ["'none'"],
+        scriptSrc: isProduction
+          ? ["'self'"]
+          : ["'self'", "'unsafe-inline'", "'unsafe-eval'"],
+        scriptSrcAttr: ["'none'"],
+        styleSrc: [
+          "'self'",
+          "'unsafe-inline'", // Required for Tailwind CSS dynamic classes, motion inline styles, and typography
+          'https://fonts.googleapis.com',
+        ],
+        fontSrc: [
+          "'self'",
+          'https://fonts.gstatic.com',
+          'data:',
+        ],
+        imgSrc: [
+          "'self'",
+          'data:',
+          'blob:',
+          'https://images.unsplash.com',
+          'https:', // Allows remote event banners, song artwork, and choir media
+        ],
+        mediaSrc: [
+          "'self'",
+          'data:',
+          'blob:',
+          'https:', // Allows choir audio tracks and external previews
+        ],
+        connectSrc: [
+          "'self'",
+          'data:',
+          'blob:',
+          'https://fonts.googleapis.com',
+          'https://fonts.gstatic.com',
+          ...(isProduction ? [] : ['ws:', 'wss:']), // Vite HMR WebSockets in development
+        ],
+        workerSrc: ["'self'", 'blob:'],
+        childSrc: ["'self'", 'blob:'],
+        manifestSrc: ["'self'"],
+        frameAncestors: [
+          "'self'",
+          'https://*.google.com',
+          'https://*.run.app',
+          'https://*.googleusercontent.com',
+        ],
+        upgradeInsecureRequests: isProduction ? [] : null,
+      },
+    },
+    // Cross-Origin Resource Policy: Allow cross-origin for static assets, audio, and manifests
+    crossOriginResourcePolicy: { policy: 'cross-origin' },
+    // Cross-Origin Opener Policy: Protect against cross-origin attacks while allowing payment/auth popups
+    crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+    // Cross-Origin Embedder Policy: Disabled to allow loading cross-origin images, fonts, and audio without requiring CORP headers on external servers
+    crossOriginEmbedderPolicy: false,
+    // Disable X-Frame-Options in favor of CSP frame-ancestors so the app can be previewed inside Google AI Studio's iframe
+    xFrameOptions: false,
+    // HTTP Strict Transport Security: Enabled in production HTTPS, disabled in local development HTTP
+    hsts: isProduction
+      ? {
+          maxAge: 31536000,
+          includeSubDomains: true,
+          preload: true,
+        }
+      : false,
+    // Referrer Policy: Standard strict-origin-when-cross-origin
+    referrerPolicy: { policy: 'strict-origin-when-cross-origin' },
+    // X-Content-Type-Options: nosniff
+    noSniff: true,
+    // Disable DNS prefetching
+    dnsPrefetchControl: { allow: false },
+    // Origin Agent Cluster
+    originAgentCluster: true,
+    // Permitted Cross Domain Policies
+    permittedCrossDomainPolicies: { permittedPolicies: 'none' },
+    // Set X-XSS-Protection
+    xssFilter: true,
+  })
+);
+
+// Set global security & CORS headers exposing Content-Type for all API endpoints
+app.use((req, res, next) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, Accept, X-Requested-With, X-Client-Timestamp');
+  res.setHeader('Access-Control-Expose-Headers', 'Content-Type, Content-Length, Authorization, X-Requested-With');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  next();
+});
+
+app.use(express.json({
+  limit: '20mb',
+  verify: (req: any, _res, buf) => {
+    req.rawBody = buf;
+  }
+}));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+
+// Ensure persistent upload directory exists
+const DB_DIR = process.env.DATA_DIR || (process.env.DATABASE_PATH ? path.dirname(process.env.DATABASE_PATH) : path.join(process.cwd(), 'data'));
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DB_DIR, 'uploads');
+if (!fs.existsSync(UPLOAD_DIR)) {
+  fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+}
+
+// Common image MIME types mapping to canonical extensions
+const MIME_TO_EXT: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/jpg': '.jpg',
+  'image/pjpeg': '.jpg',
+  'image/png': '.png',
+  'image/x-png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/svg+xml': '.svg',
+  'image/avif': '.avif',
+  'image/bmp': '.bmp',
+  'image/x-ms-bmp': '.bmp',
+  'image/tiff': '.tiff',
+  'image/x-icon': '.ico',
+  'image/vnd.microsoft.icon': '.ico',
+  'image/heic': '.heic',
+  'image/heif': '.heif',
+};
+
+// Multer for media uploads (logos, song covers, event posters, audio files, documents)
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    if (!fs.existsSync(UPLOAD_DIR)) {
+      fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    }
+    cb(null, UPLOAD_DIR);
+  },
+  filename: (req, file, cb) => {
+    const rawExt = path.extname(file.originalname || '');
+    let ext = rawExt.toLowerCase();
+    if (!ext && file.mimetype) {
+      ext = MIME_TO_EXT[file.mimetype.toLowerCase()] || `.${file.mimetype.split('/')[1]?.toLowerCase().replace(/[^a-z0-9]/g, '')}`;
+    }
+    const cleanExt = ext || '.jpg';
+    // Strip original extension safely (case-insensitive)
+    const rawBase = path.basename(file.originalname || 'upload', rawExt)
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .substring(0, 50);
+    const baseName = rawBase && rawBase.replace(/^_+|_+$/g, '') ? rawBase.replace(/^_+|_+$/g, '') : 'upload';
+    const uniqueName = `${baseName}-${Date.now()}-${Math.round(Math.random() * 1e6)}${cleanExt}`;
+    cb(null, uniqueName);
+  },
+});
+
+const upload = multer({
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max (generous for high-res banners/posters)
+});
+
+// Middleware supporting single or multiple file uploads from any field name
+// ('file', 'image', 'photo', 'cover', 'poster', 'artwork', 'banner')
+// Only executes Multer if request is multipart/form-data, passing cleanly through otherwise
+const uploadFlexible = (req: any, res: any, next: any) => {
+  const contentType = (req.headers['content-type'] || '').toLowerCase();
+  if (!contentType.includes('multipart/form-data')) {
+    return next();
+  }
+
+  upload.any()(req, res, (err: any) => {
+    if (err) {
+      if (err instanceof multer.MulterError) {
+        if (err.code === 'LIMIT_FILE_SIZE') {
+          return res.status(400).json({ error: 'Ingano y\'ifoto irenze urugero rwemewe (File is too large, max 50MB)' });
+        }
+        return res.status(400).json({ error: `Upload error: ${err.message}` });
+      }
+      return res.status(400).json({ error: err.message || 'Upload error' });
+    }
+    if (!req.file && Array.isArray(req.files) && req.files.length > 0) {
+      // Prioritize file matching common image field names if present
+      const preferred = req.files.find((f: any) => ['file', 'image', 'photo', 'cover', 'poster', 'artwork'].includes(f.fieldname)) || req.files[0];
+      req.file = preferred;
+    }
+    next();
+  });
+};
+
+// Supported image extensions (all standard web formats)
+const VALID_IMAGE_EXTS = new Set([
+  '.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg', '.avif', '.bmp', '.ico',
+  '.tiff', '.tif', '.jfif', '.pjpeg', '.pjp', '.heic', '.heif'
+]);
+
+const DANGEROUS_EXTS = new Set([
+  '.exe', '.bat', '.cmd', '.sh', '.bash', '.php', '.phtml', '.php3', '.php4', '.php5',
+  '.pl', '.py', '.rb', '.cgi', '.js', '.vbs', '.wsf', '.msi', '.dll', '.scr', '.jar', '.com', '.vbe'
+]);
+
+function isFileSafeImage(file: Express.Multer.File): { valid: boolean; reason?: string } {
+  const original = file.originalname || '';
+  const ext = path.extname(original).toLowerCase();
+
+  // 1. Block dangerous executable files by extension
+  if (DANGEROUS_EXTS.has(ext)) {
+    return { valid: false, reason: 'Dosiye zikoresha porogaramu (executable files) ntizemewe nk\'ifoto.' };
+  }
+
+  // 2. Read first 512 bytes for binary magic byte inspection
+  let buffer: Buffer;
+  try {
+    const fd = fs.openSync(file.path, 'r');
+    buffer = Buffer.alloc(Math.min(file.size || 512, 512));
+    fs.readSync(fd, buffer, 0, buffer.length, 0);
+    fs.closeSync(fd);
+  } catch {
+    buffer = Buffer.alloc(0);
+  }
+
+  if (buffer.length >= 2) {
+    // Block Windows PE/DOS executable (MZ)
+    if (buffer[0] === 0x4D && buffer[1] === 0x5A) {
+      return { valid: false, reason: 'Dosiye ya executable ntishobora gukoreshwa nk\'ifoto.' };
+    }
+    // Block Linux ELF binaries
+    if (buffer.length >= 4 && buffer[0] === 0x7F && buffer[1] === 0x45 && buffer[2] === 0x4C && buffer[3] === 0x46) {
+      return { valid: false, reason: 'Dosiye ya binary ntishobora gukoreshwa nk\'ifoto.' };
+    }
+    // Block shell scripts (shebang #!)
+    if (buffer[0] === 0x23 && buffer[1] === 0x21) {
+      return { valid: false, reason: 'Script files ntizemewe nk\'ifoto.' };
+    }
+    // Block Java bytecode (0xCAFEBABE)
+    if (buffer.length >= 4 && buffer[0] === 0xCA && buffer[1] === 0xFE && buffer[2] === 0xBA && buffer[3] === 0xBE) {
+      return { valid: false, reason: 'Java bytecode ntizemewe nk\'ifoto.' };
+    }
+  }
+
+  // 3. For SVG files, inspect text content to prevent script injection (XSS)
+  const isSvg = ext === '.svg' || (file.mimetype && file.mimetype.toLowerCase().includes('svg'));
+  if (isSvg) {
+    try {
+      const fullText = fs.readFileSync(file.path, 'utf-8').toLowerCase();
+      if (
+        fullText.includes('<script') ||
+        fullText.includes('javascript:') ||
+        fullText.includes('onload=') ||
+        fullText.includes('onerror=') ||
+        fullText.includes('onclick=') ||
+        fullText.includes('onmouseover=')
+      ) {
+        return { valid: false, reason: 'Dosiye ya SVG irimo kode ya script itemewe. Nyamuneka koresha SVG ifunguye neza idafite scripts.' };
+      }
+    } catch {
+      // If reading fails, proceed safely
+    }
+  }
+
+  // 4. Validate mimetype and extension
+  const isMimeImage = (file.mimetype && file.mimetype.toLowerCase().startsWith('image/')) ||
+    file.mimetype === 'application/octet-stream' ||
+    !file.mimetype;
+  const isExtImage = VALID_IMAGE_EXTS.has(ext) || ext === '';
+
+  // Check known image binary signatures
+  const isJpeg = buffer.length >= 3 && buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF;
+  const isPng = buffer.length >= 8 && buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47;
+  const isGif = buffer.length >= 4 && buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x38;
+  const isWebp = buffer.length >= 12 && buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP';
+  const isBmp = buffer.length >= 2 && buffer[0] === 0x42 && buffer[1] === 0x4D;
+  const isTiff = buffer.length >= 4 && ((buffer[0] === 0x49 && buffer[1] === 0x49 && buffer[2] === 0x2A && buffer[3] === 0x00) || (buffer[0] === 0x4D && buffer[1] === 0x4D && buffer[2] === 0x00 && buffer[3] === 0x2A));
+  const isIco = buffer.length >= 4 && buffer[0] === 0x00 && buffer[1] === 0x00 && (buffer[2] === 0x01 || buffer[2] === 0x02) && buffer[3] === 0x00;
+  const isAvifOrHeic = buffer.length >= 12 && buffer.subarray(4, 8).toString('ascii') === 'ftyp';
+
+  const hasImageMagic = isJpeg || isPng || isGif || isWebp || isBmp || isTiff || isIco || isAvifOrHeic || isSvg;
+
+  if (!hasImageMagic && !isMimeImage && !isExtImage) {
+    return { valid: false, reason: 'Ubwoko bw\'ifoto ntibwemewe. Koresha JPG, PNG, WEBP, GIF, SVG, AVIF, cyangwa BMP.' };
+  }
+
+  return { valid: true };
+}
+
+// Service worker and manifest routes with optimal caching and PWA headers
+app.get(['/sw.js', '/workbox-*.js'], (req, res, next) => {
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Service-Worker-Allowed', '/');
+  next();
+});
+
+app.get(['/manifest.json', '/manifest.webmanifest'], (req, res, next) => {
+  res.setHeader('Content-Type', 'application/manifest+json; charset=utf-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  next();
+});
+
+// Serve uploaded files statically from persistent directory, with fallback for existing public/uploads
+app.use('/uploads', express.static(UPLOAD_DIR));
+const legacyUploadDir = path.join(process.cwd(), 'public', 'uploads');
+if (fs.existsSync(legacyUploadDir) && legacyUploadDir !== UPLOAD_DIR) {
+  app.use('/uploads', express.static(legacyUploadDir));
+}
+app.use('/audio', express.static(path.join(process.cwd(), 'public', 'audio')));
+
+// -------------------------------------------------------------
+// REAL-TIME EVENT STREAMING (Server-Sent Events / SSE)
+// -------------------------------------------------------------
+
+app.get('/api/events/stream', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders();
+
+  // Send initial connection handshake
+  res.write(`event: connected\ndata: ${JSON.stringify({ status: 'connected', time: new Date().toISOString() })}\n\n`);
+  eventStreamClients.add(res);
+
+  // Keep-alive heartbeat every 20 seconds
+  const timer = setInterval(() => {
+    try {
+      res.write(': heartbeat\n\n');
+    } catch {
+      clearInterval(timer);
+      eventStreamClients.delete(res);
+    }
+  }, 20000);
+
+  req.on('close', () => {
+    clearInterval(timer);
+    eventStreamClients.delete(res);
+  });
+});
+
+// -------------------------------------------------------------
+// PUBLIC BRANDING & SETTINGS API
+// -------------------------------------------------------------
+app.get('/api/branding', (req, res) => {
+  try {
+    const branding = db.prepare('SELECT * FROM branding_settings WHERE id = ?').get('default_branding') as any;
+    const settingsRows = db.prepare('SELECT key, value FROM app_settings').all() as any[];
+    const settings: Record<string, string> = {};
+    settingsRows.forEach(r => { settings[r.key] = r.value; });
+
+    res.json({
+      branding: branding || {},
+      settings
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch branding settings' });
+  }
+});
+
+// -------------------------------------------------------------
+// PUBLIC CHOIR LEADERSHIP CONTACT INFORMATION API
+// -------------------------------------------------------------
+app.get('/api/contacts', (req, res) => {
+  try {
+    let contacts = db.prepare('SELECT * FROM leadership_contacts WHERE id = ?').get('default_contacts') as any;
+    if (!contacts) {
+      contacts = {
+        id: 'default_contacts',
+        leader_name: '[INSERT NAME]',
+        leader_phone: '[INSERT PHONE NUMBER]',
+        leader_whatsapp: '[INSERT WHATSAPP NUMBER]',
+        leader_title_rw: 'Umuyobozi wa Korali',
+        leader_title_en: 'Choir Leader / President',
+        secretary_name: '[INSERT NAME]',
+        secretary_phone: '[INSERT PHONE NUMBER]',
+        secretary_whatsapp: '[INSERT WHATSAPP NUMBER]',
+        secretary_title_rw: 'Umunyamabanga wa Korali',
+        secretary_title_en: 'Choir Secretary',
+        general_phone: '[INSERT PHONE NUMBER]',
+        general_whatsapp: '[INSERT WHATSAPP NUMBER]',
+        general_email: '[INSERT EMAIL ADDRESS]',
+        address: '[INSERT CHOIR ADDRESS]',
+        city: 'Kigali',
+        country: 'Rwanda',
+        weekday_range: 'Kuwa Mbere – Kuwa Gatanu (Monday–Friday)',
+        weekday_hours: '[INSERT HOURS]',
+        weekend_range: 'Kuwa Gatandatu – Ku Cyumweru (Saturday–Sunday)',
+        weekend_hours: '[INSERT HOURS]',
+        contact_description_rw: 'Ufite ikibazo, igitekerezo, cyangwa ushaka kumenya byinshi kuri La Lumiere Choir? Twandikire cyangwa utuvugishe ukoresheje bumwe mu buryo bukurikira.',
+        contact_description_en: 'Do you have questions, feedback, or need information about La Lumiere Choir? Get in touch with our leadership team using the options below.',
+      };
+    }
+
+    res.json(contacts);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch choir leadership contact details' });
+  }
+});
+
+// -------------------------------------------------------------
+// HEALTH CHECK
+// -------------------------------------------------------------
+app.get('/api/health', (req, res) => {
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    service: 'La Lumiere Choir API',
+    uptime: process.uptime(),
+  });
+});
+
+// -------------------------------------------------------------
+// SECURE CHOIR MEMBER DIRECTORY & MANAGEMENT API
+// -------------------------------------------------------------
+app.use('/api/members', membersRouter);
+
+app.put('/api/members/privacy', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const { share_directory, share_phone, share_email, share_whatsapp } = req.body;
+    db.prepare(`
+      UPDATE users
+      SET share_directory = CASE WHEN ? IS NOT NULL THEN ? ELSE share_directory END,
+          share_phone = CASE WHEN ? IS NOT NULL THEN ? ELSE share_phone END,
+          share_email = CASE WHEN ? IS NOT NULL THEN ? ELSE share_email END,
+          share_whatsapp = CASE WHEN ? IS NOT NULL THEN ? ELSE share_whatsapp END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      share_directory !== undefined ? (share_directory ? 1 : 0) : null,
+      share_directory !== undefined ? (share_directory ? 1 : 0) : null,
+      share_phone !== undefined ? (share_phone ? 1 : 0) : null,
+      share_phone !== undefined ? (share_phone ? 1 : 0) : null,
+      share_email !== undefined ? (share_email ? 1 : 0) : null,
+      share_email !== undefined ? (share_email ? 1 : 0) : null,
+      share_whatsapp !== undefined ? (share_whatsapp ? 1 : 0) : null,
+      share_whatsapp !== undefined ? (share_whatsapp ? 1 : 0) : null,
+      req.user!.id
+    );
+
+    const updated = db.prepare(`
+      SELECT id, name, email, phone, choir_voice, choir_role,
+             share_directory, share_phone, share_email, share_whatsapp
+      FROM users WHERE id = ?
+    `).get(req.user!.id) as any;
+
+    res.json({
+      message: 'Igenzura ry\'umutekano n\'ibanga ryavuguruwe (Privacy settings updated)',
+      privacy: {
+        share_directory: Boolean(updated.share_directory),
+        share_phone: Boolean(updated.share_phone),
+        share_email: Boolean(updated.share_email),
+        share_whatsapp: Boolean(updated.share_whatsapp)
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update privacy settings' });
+  }
+});
+
+// -------------------------------------------------------------
+// OFFICIAL SOCIAL MEDIA LINKS API
+// -------------------------------------------------------------
+
+// Helper to validate and normalize URL
+function validateAndNormalizeUrl(rawUrl: string): { valid: boolean; normalized?: string; error?: string } {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return { valid: false, error: 'URL is required' };
+  }
+  const trimmed = rawUrl.trim();
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      return { valid: false, error: 'Please enter a valid HTTP or HTTPS URL (Ugomba gukoresha https:// cyangwa http://)' };
+    }
+    return { valid: true, normalized: parsed.toString() };
+  } catch (e) {
+    return { valid: false, error: 'Please enter a valid social media URL (Uru rubuga si rwo, reba neza https://...)' };
+  }
+}
+
+// Public: Get all enabled social media links ordered by display_order
+app.get('/api/social-media', (_req, res) => {
+  try {
+    const links = db.prepare(`
+      SELECT id, platform, display_name, url, icon, is_enabled, display_order, description
+      FROM social_media_links
+      WHERE is_enabled = 1
+      ORDER BY display_order ASC, created_at ASC
+    `).all();
+    res.json(links);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to load social media links' });
+  }
+});
+
+// Admin: Get all social media links (including disabled ones)
+app.get('/api/admin/social-media', requireAdmin, (_req, res) => {
+  try {
+    const links = db.prepare(`
+      SELECT id, platform, display_name, url, icon, is_enabled, display_order, description, created_at, updated_at
+      FROM social_media_links
+      ORDER BY display_order ASC, created_at ASC
+    `).all();
+    res.json(links);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to load admin social media links' });
+  }
+});
+
+// Admin: Create new social media link
+app.post('/api/admin/social-media', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { platform, display_name, url, icon, is_enabled, display_order, description } = req.body;
+    if (!platform || !display_name || !url) {
+      return res.status(400).json({ error: 'Platform, display name, and URL are required' });
+    }
+
+    const valResult = validateAndNormalizeUrl(url);
+    if (!valResult.valid) {
+      return res.status(400).json({ error: valResult.error });
+    }
+
+    const id = 'soc_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+    const order = typeof display_order === 'number' ? display_order : 0;
+    const enabled = is_enabled !== undefined ? (is_enabled ? 1 : 0) : 1;
+    const platformClean = String(platform).trim().toLowerCase();
+    const iconClean = icon ? String(icon).trim() : platformClean;
+
+    db.prepare(`
+      INSERT INTO social_media_links (id, platform, display_name, url, icon, is_enabled, display_order, description, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+    `).run(id, platformClean, display_name.trim(), valResult.normalized, iconClean, enabled, order, description ? description.trim() : null);
+
+    const created = db.prepare('SELECT * FROM social_media_links WHERE id = ?').get(id);
+    res.status(201).json(created);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to create social media link' });
+  }
+});
+
+// Admin: Update existing social media link
+app.put('/api/admin/social-media/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { platform, display_name, url, icon, is_enabled, display_order, description } = req.body;
+
+    const existing = db.prepare('SELECT id FROM social_media_links WHERE id = ?').get(id);
+    if (!existing) {
+      return res.status(404).json({ error: 'Social media link not found' });
+    }
+
+    let normalizedUrl: string | undefined;
+    if (url !== undefined) {
+      const valResult = validateAndNormalizeUrl(url);
+      if (!valResult.valid) {
+        return res.status(400).json({ error: valResult.error });
+      }
+      normalizedUrl = valResult.normalized;
+    }
+
+    db.prepare(`
+      UPDATE social_media_links
+      SET platform = COALESCE(?, platform),
+          display_name = COALESCE(?, display_name),
+          url = COALESCE(?, url),
+          icon = COALESCE(?, icon),
+          is_enabled = CASE WHEN ? IS NOT NULL THEN ? ELSE is_enabled END,
+          display_order = COALESCE(?, display_order),
+          description = CASE WHEN ? IS NOT NULL THEN ? ELSE description END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      platform !== undefined ? String(platform).trim().toLowerCase() : null,
+      display_name !== undefined ? String(display_name).trim() : null,
+      normalizedUrl ?? null,
+      icon !== undefined ? String(icon).trim() : null,
+      is_enabled !== undefined ? (is_enabled ? 1 : 0) : null,
+      is_enabled !== undefined ? (is_enabled ? 1 : 0) : null,
+      typeof display_order === 'number' ? display_order : null,
+      description !== undefined ? description : null,
+      description !== undefined ? description : null,
+      id
+    );
+
+    const updated = db.prepare('SELECT * FROM social_media_links WHERE id = ?').get(id);
+    res.json(updated);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update social media link' });
+  }
+});
+
+// Admin: Delete social media link
+app.delete('/api/admin/social-media/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const info = db.prepare('DELETE FROM social_media_links WHERE id = ?').run(id);
+    if (info.changes === 0) {
+      return res.status(404).json({ error: 'Social media link not found' });
+    }
+    res.json({ message: 'Social media link deleted successfully', id });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to delete social media link' });
+  }
+});
+
+// Admin: Bulk Reorder social media links
+app.post('/api/admin/social-media/reorder', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { items } = req.body; // array of { id: string, display_order: number }
+    if (!Array.isArray(items)) {
+      return res.status(400).json({ error: 'Items array is required' });
+    }
+
+    db.exec('BEGIN TRANSACTION;');
+    try {
+      const updateStmt = db.prepare('UPDATE social_media_links SET display_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?');
+      for (const item of items) {
+        if (item.id && typeof item.display_order === 'number') {
+          updateStmt.run(item.display_order, item.id);
+        }
+      }
+      db.exec('COMMIT;');
+    } catch (txErr) {
+      db.exec('ROLLBACK;');
+      throw txErr;
+    }
+
+    const updatedList = db.prepare(`
+      SELECT id, platform, display_name, url, icon, is_enabled, display_order, description, created_at, updated_at
+      FROM social_media_links
+      ORDER BY display_order ASC, created_at ASC
+    `).all();
+
+    res.json({ success: true, links: updatedList });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to reorder social media links' });
+  }
+});
+
+
+// -------------------------------------------------------------
+// AUTHENTICATION ROUTES
+// -------------------------------------------------------------
+app.post('/api/auth/register', (req, res) => {
+  try {
+    const { name, email, password, phone } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Amazina, imeli n\'ijambo ry\'ibanga birakenewe (Name, email, and password required)' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Ijambo ry\'ibanga rigomba kugira byibuze inyuguti 6 (Password must be at least 6 characters)' });
+    }
+
+    const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email.trim().toLowerCase());
+    if (existing) {
+      return res.status(400).json({ error: 'Iyi imeli isanzwe ikoreshwa (Email already registered)' });
+    }
+
+    const userId = 'usr_' + Date.now();
+    const hash = hashPassword(password);
+    const userRole = 'supporter';
+
+    db.prepare(`
+      INSERT INTO users (id, name, email, password_hash, phone, role)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(userId, name.trim(), email.trim().toLowerCase(), hash, phone?.trim() || null, userRole);
+
+    const token = generateToken({ id: userId, email: email.trim().toLowerCase(), role: userRole, name: name.trim() });
+
+    // Send welcome notification
+    db.prepare(`
+      INSERT INTO notifications (id, user_id, title, body, type, link)
+      VALUES (?, ?, ?, ?, 'community', ?)
+    `).run(
+      'notif_' + Date.now(),
+      userId,
+      'Murakaza neza muri La Lumiere Choir!',
+      'Urakoze kwiyandikisha. Ikaze mu muryango w\'abakunzi b\'indirimbo za La Lumiere Choir, ADEPR Nyanza.',
+      '/songs'
+    );
+
+    res.status(201).json({
+      message: 'Konte yafunguwe neza (Account created successfully)',
+      token,
+      user: { id: userId, name: name.trim(), email: email.trim().toLowerCase(), role: userRole, phone }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu kwiyandikisha' });
+  }
+});
+
+// -------------------------------------------------------------
+// BRUTE-FORCE LOGIN PROTECTION & RATE LIMITING
+// -------------------------------------------------------------
+interface LoginAttemptRecord {
+  attempts: number;
+  firstAttempt: number;
+  lockedUntil: number;
+}
+const loginAttemptsMap = new Map<string, LoginAttemptRecord>();
+
+function checkLoginRateLimit(key: string, maxAttempts = 5, lockDurationMs = 15 * 60 * 1000): { isBlocked: boolean; retryAfterSeconds: number } {
+  const now = Date.now();
+  const record = loginAttemptsMap.get(key);
+  if (!record) {
+    return { isBlocked: false, retryAfterSeconds: 0 };
+  }
+  if (record.lockedUntil > now) {
+    const retryAfterSeconds = Math.ceil((record.lockedUntil - now) / 1000);
+    return { isBlocked: true, retryAfterSeconds };
+  }
+  if (now - record.firstAttempt > lockDurationMs) {
+    loginAttemptsMap.delete(key);
+    return { isBlocked: false, retryAfterSeconds: 0 };
+  }
+  return { isBlocked: false, retryAfterSeconds: 0 };
+}
+
+function recordFailedLogin(key: string, maxAttempts = 5, lockDurationMs = 15 * 60 * 1000) {
+  const now = Date.now();
+  const record = loginAttemptsMap.get(key) || { attempts: 0, firstAttempt: now, lockedUntil: 0 };
+  record.attempts += 1;
+  if (record.attempts >= maxAttempts) {
+    record.lockedUntil = now + lockDurationMs;
+  }
+  loginAttemptsMap.set(key, record);
+}
+
+function recordSuccessfulLogin(key: string) {
+  loginAttemptsMap.delete(key);
+}
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Imeli n\'ijambo ry\'ibanga birakenewe' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const rateLimitKey = `${req.ip || 'ip'}_user_${cleanEmail}`;
+    const rateLimitCheck = checkLoginRateLimit(rateLimitKey);
+    if (rateLimitCheck.isBlocked) {
+      return res.status(429).json({
+        error: `Mwakoresheje uburyo bwinshi bwo kwinjira bwananiwe. Tegereza iminota ${Math.ceil(rateLimitCheck.retryAfterSeconds / 60)} mbere yo kongera kugerageza (Too many failed login attempts. Please try again in 15 minutes.)`
+      });
+    }
+
+    logAuthDiagnostic(req, 'User Login');
+
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(TRIM(email)) = ?').get(cleanEmail) as any;
+    if (!user) {
+      recordFailedLogin(rateLimitKey);
+      return res.status(401).json({ error: 'Imeli cyangwa ijambo ry\'ibanga si byo (Invalid email or password)' });
+    }
+
+    // Secure bcrypt hash comparison using bcrypt.compare()
+    const { isMatch, needsRehash } = await comparePassword(password, user.password_hash);
+    if (!isMatch) {
+      recordFailedLogin(rateLimitKey);
+      return res.status(401).json({ error: 'Imeli cyangwa ijambo ry\'ibanga si byo (Invalid email or password)' });
+    }
+
+    recordSuccessfulLogin(rateLimitKey);
+
+    // Auto-upgrade legacy unhashed passwords to bcrypt
+    if (needsRehash) {
+      const upgradedHash = hashPassword(password);
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(upgradedHash, user.id);
+    }
+
+    const token = generateToken({ id: user.id, email: user.email, role: user.role, name: user.name });
+
+    logActivity(user.id, user.name, user.role, 'USER_LOGIN', 'auth', user.id, `User ${user.email} logged in successfully`);
+
+    res.json({
+      message: 'Mwinjiye neza (Logged in successfully)',
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        phone: user.phone,
+        avatar_url: user.avatar_url
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Habaye ikosa mu kwinjira' });
+  }
+});
+
+// Dedicated secure Admin Login endpoint
+app.all('/api/admin/login', (req, res, next) => {
+  if (req.method !== 'POST') {
+    res.setHeader('Content-Type', 'application/json');
+    return res.status(405).json({
+      success: false,
+      message: 'Uburyo bwo gusaba butemewe (Method Not Allowed). Please send a POST request with admin credentials.',
+      error: 'Method Not Allowed'
+    });
+  }
+  next();
+});
+
+app.post('/api/admin/login', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const diag = logAuthDiagnostic(req, 'Admin Login');
+    const { email, password } = req.body || {};
+    const clientTimestamp = req.headers['x-client-timestamp'] || new Date().toISOString();
+
+    if (!email || typeof email !== 'string' || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Imeli n\'ijambo ry\'ibanga birakenewe (Email and password required)',
+        error: 'Imeli n\'ijambo ry\'ibanga birakenewe (Email and password required)',
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const rateLimitKey = `${req.ip || 'ip'}_admin_${cleanEmail}`;
+    const rateLimitCheck = checkLoginRateLimit(rateLimitKey);
+    if (rateLimitCheck.isBlocked) {
+      return res.status(429).json({
+        success: false,
+        message: `Mwakoresheje uburyo bwinshi bwo kwinjira bwananiwe. Tegereza iminota ${Math.ceil(rateLimitCheck.retryAfterSeconds / 60)} mbere yo kongera kugerageza (Too many failed login attempts. Please try again in 15 minutes.)`,
+        error: 'Too many failed login attempts'
+      });
+    }
+
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(TRIM(email)) = ?').get(cleanEmail) as any;
+
+    if (!user) {
+      recordFailedLogin(rateLimitKey);
+      return res.status(401).json({
+        success: false,
+        message: 'Imeli cyangwa ijambo ry\'ibanga si byo (Invalid admin credentials)',
+        error: 'Imeli cyangwa ijambo ry\'ibanga si byo (Invalid admin credentials)',
+      });
+    }
+
+    // Ensure the stored Admin password is compared using bcrypt.compare()
+    let isMatch = false;
+    let needsRehash = false;
+
+    if (user.password_hash) {
+      const isBcrypt =
+        (user.password_hash.startsWith('$2a$') || user.password_hash.startsWith('$2b$') || user.password_hash.startsWith('$2y$')) &&
+        user.password_hash.length === 60;
+
+      if (isBcrypt) {
+        isMatch = await bcrypt.compare(password, user.password_hash);
+      } else {
+        const comp = await comparePassword(password, user.password_hash);
+        isMatch = comp.isMatch;
+        needsRehash = comp.needsRehash;
+      }
+    }
+
+    if (!isMatch) {
+      recordFailedLogin(rateLimitKey);
+      return res.status(401).json({
+        success: false,
+        message: 'Imeli cyangwa ijambo ry\'ibanga si byo (Invalid admin credentials)',
+        error: 'Imeli cyangwa ijambo ry\'ibanga si byo (Invalid admin credentials)',
+      });
+    }
+
+    recordSuccessfulLogin(rateLimitKey);
+
+    // Seamlessly upgrade legacy unhashed credentials to bcrypt hash
+    if (needsRehash) {
+      const upgradedHash = hashPassword(password);
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(upgradedHash, user.id);
+      console.log(`[Admin Login Diagnostic] Automatically upgraded unhashed password to bcrypt hash for "${cleanEmail}".`);
+    }
+
+    if (user.is_disabled) {
+      console.warn(`[Admin Login Diagnostic] Rejected 403: Account "${cleanEmail}" is disabled (is_disabled = 1).`);
+      return res.status(403).json({
+        success: false,
+        message: 'Konti yawe yahagaritswe n\'ubuyobozi (Account has been disabled by administrator)',
+        error: 'Konti yawe yahagaritswe n\'ubuyobozi (Account has been disabled by administrator)',
+        diagnostic: {
+          code: 'ACCOUNT_DISABLED',
+          reason: 'User account has been disabled in database',
+          emailSearched: cleanEmail,
+          accountRole: user.role
+        }
+      });
+    }
+
+    if (!isUserAdmin(user.role)) {
+      console.warn(`[Admin Login Diagnostic] Rejected 403: User "${cleanEmail}" has non-admin role "${user.role}".`);
+      return res.status(403).json({
+        success: false,
+        message: 'Konti yawe ntabwo ifite uburenganzira bwa Admin (Access denied: Admin privileges required)',
+        error: 'Konti yawe ntabwo ifite uburenganzira bwa Admin (Access denied: Admin privileges required)',
+        diagnostic: {
+          code: 'INSUFFICIENT_PERMISSIONS',
+          reason: `Account has role '${user.role}' which does not grant admin access`,
+          emailSearched: cleanEmail,
+          currentRole: user.role,
+          requiredRoles: ['super_admin', 'admin', 'content_admin', 'moderator']
+        }
+      });
+    }
+
+    const token = generateToken({ id: user.id, email: user.email, role: user.role, name: user.name });
+
+    console.log(`[Admin Login Diagnostic] Approved 200: Successfully authenticated "${user.email}" (${user.role}) via bcrypt hash comparison.`);
+    logActivity(user.id, user.name, user.role, 'ADMIN_LOGIN', 'auth', user.id, `Admin logged in with role ${user.role} (bcrypt verified)`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Mwinjiye neza mu Buyobozi bwa La Lumiere Choir (Login successful)',
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        phone: user.phone || '',
+        avatar_url: user.avatar_url || ''
+      },
+      diagnostic: {
+        code: 'LOGIN_SUCCESS',
+        email: user.email,
+        role: user.role,
+        hashType: 'bcrypt',
+        verifiedAt: new Date().toISOString()
+      }
+    });
+  } catch (err: any) {
+    console.error('[Admin Login Diagnostic] Unhandled error during login:', err);
+    return res.status(500).json({
+      success: false,
+      message: 'Habaye ikosa rya tekiniki muri seriveri mu kwinjira (Internal server error during login)',
+      error: err.message || 'Internal server error',
+      diagnostic: {
+        code: 'INTERNAL_SERVER_ERROR',
+        details: err.message || 'Unknown error'
+      }
+    });
+  }
+});
+
+// -------------------------------------------------------------
+// SECURE ADMIN ACCOUNT REGISTRATION & VERIFICATION ENDPOINTS
+// -------------------------------------------------------------
+
+/**
+ * Admin Account Registration Endpoint
+ * Securely hashes passwords using bcrypt before saving to the database.
+ * Never stores raw password strings.
+ */
+app.post('/api/admin/register', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    logAuthDiagnostic(req, 'Admin Register');
+    const { name, email, password, phone, role, setup_key } = req.body || {};
+
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Amazina yose y\'umuyobozi arakenewe (Administrator full name is required)'
+      });
+    }
+
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({
+        success: false,
+        error: 'Imeli yemewe y\'umuyobozi irakenewe (Valid admin email is required)'
+      });
+    }
+
+    if (!password || typeof password !== 'string' || password.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'Ijambo ry\'ibanga ry\'umuyobozi rigomba kugira byibuze inyuguti 8 (Admin password must be at least 8 characters)'
+      });
+    }
+
+    // Role assignment: restrict to recognized administrative roles
+    const validAdminRoles = ['super_admin', 'admin', 'content_admin', 'moderator'];
+    const assignedRole = role && validAdminRoles.includes(role) ? role : 'admin';
+
+    // Authorization verification:
+    // If ADMIN_SETUP_KEY or ADMIN_SECRET is configured, require either the setup key or a valid super_admin Bearer token
+    const expectedSetupKey = process.env.ADMIN_SETUP_KEY || process.env.ADMIN_SECRET_KEY;
+    const authHeader = req.headers.authorization;
+    let isSuperAdminToken = false;
+
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const decoded = verifyToken(authHeader.substring(7));
+      if (decoded && (decoded.role === 'super_admin' || decoded.role === 'admin')) {
+        isSuperAdminToken = true;
+      }
+    }
+
+    if (expectedSetupKey && !isSuperAdminToken) {
+      if (!setup_key || setup_key !== expectedSetupKey) {
+        return res.status(403).json({
+          success: false,
+          error: 'Uruhushya rwo kwandika umuyobozi rwanze (Unauthorized: Admin setup key or Super Admin token required)'
+        });
+      }
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const existing = db.prepare('SELECT id, email, role FROM users WHERE LOWER(TRIM(email)) = ?').get(cleanEmail) as any;
+    if (existing) {
+      return res.status(409).json({
+        success: false,
+        error: 'Iyi imeli isanzwe ifite konti muri sisitemu (Email already registered)'
+      });
+    }
+
+    // Bcrypt hashing: salt and hash password before storage
+    const newAdminId = `usr_admin_${Date.now()}`;
+    const passwordBcryptHash = hashPassword(password);
+
+    db.prepare(`
+      INSERT INTO users (id, name, email, password_hash, phone, role, is_disabled)
+      VALUES (?, ?, ?, ?, ?, ?, 0)
+    `).run(newAdminId, name.trim(), cleanEmail, passwordBcryptHash, phone?.trim() || null, assignedRole);
+
+    const token = generateToken({
+      id: newAdminId,
+      email: cleanEmail,
+      role: assignedRole,
+      name: name.trim()
+    });
+
+    logActivity(
+      newAdminId,
+      name.trim(),
+      assignedRole,
+      'REGISTER_ADMIN',
+      'users',
+      newAdminId,
+      `Registered new administrator "${cleanEmail}" (${assignedRole}) with bcrypt password hashing`
+    );
+
+    console.log(`[Admin Registration] Successfully registered administrator "${cleanEmail}" with role "${assignedRole}" (bcrypt hashed).`);
+
+    return res.status(201).json({
+      success: true,
+      message: 'Konti y\'ubuyobozi yafunguwe neza (Admin account registered successfully with bcrypt security)',
+      token,
+      user: {
+        id: newAdminId,
+        name: name.trim(),
+        email: cleanEmail,
+        role: assignedRole,
+        phone: phone?.trim() || ''
+      }
+    });
+  } catch (err: any) {
+    console.error('[Admin Registration Error]:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Habaye ikosa mu kwandika umuyobozi'
+    });
+  }
+});
+
+// -------------------------------------------------------------
+// FIRST ADMIN ACCOUNT INITIALIZATION & SETUP ENDPOINTS
+// -------------------------------------------------------------
+
+/**
+ * Setup function endpoint: inspects current Admin account hash state in database
+ */
+app.get('/api/admin/setup/status', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const adminCount = (db.prepare("SELECT COUNT(*) as count FROM users WHERE role IN ('super_admin', 'admin')").get() as any)?.count || 0;
+    const configuredAdminEmail = (process.env.ADMIN_EMAIL || 'admin@lalumierechoir.rw').trim().toLowerCase();
+    const targetAdmin = db.prepare('SELECT id, email, role, is_disabled, password_hash FROM users WHERE LOWER(TRIM(email)) = ?').get(configuredAdminEmail) as any;
+
+    const hasBcrypt = Boolean(
+      targetAdmin?.password_hash &&
+      (targetAdmin.password_hash.startsWith('$2a$') || targetAdmin.password_hash.startsWith('$2b$') || targetAdmin.password_hash.startsWith('$2y$')) &&
+      targetAdmin.password_hash.length === 60
+    );
+
+    res.json({
+      success: true,
+      adminAccountsCount: adminCount,
+      hasAdminAccounts: adminCount > 0,
+      targetAdminExists: Boolean(targetAdmin),
+      targetAdminEmail: configuredAdminEmail,
+      hasBcryptHash: hasBcrypt
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'Failed to inspect admin setup status' });
+  }
+});
+
+/**
+ * Setup function endpoint: initializes the first admin account hash if it does not already exist
+ */
+app.post('/api/admin/setup', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    logAuthDiagnostic(req, 'Admin Setup');
+    const { email, password, name, phone, role, setup_key, forceUpdate } = req.body || {};
+
+    const adminCount = (db.prepare("SELECT COUNT(*) as count FROM users WHERE role IN ('super_admin', 'admin')").get() as any)?.count || 0;
+
+    // If an admin already exists, verify authorization via setup_key or super_admin token
+    if (adminCount > 0 && !forceUpdate) {
+      const expectedKey = process.env.ADMIN_SETUP_KEY || process.env.ADMIN_SECRET_KEY || 'lalumiere-setup-2026';
+      const authHeader = req.headers.authorization;
+      let authorized = false;
+
+      if (setup_key && setup_key === expectedKey) {
+        authorized = true;
+      }
+      if (authHeader?.startsWith('Bearer ')) {
+        const decoded = verifyToken(authHeader.substring(7));
+        if (decoded && (decoded.role === 'super_admin' || decoded.role === 'admin')) {
+          authorized = true;
+        }
+      }
+
+      // If already initialized and not supplying key, return existing status
+      if (!authorized) {
+        const result = await setupFirstAdminAccount({
+          email,
+          password,
+          name,
+          phone,
+          role,
+          forceUpdate: false
+        });
+
+        return res.status(200).json({
+          success: true,
+          ...result
+        });
+      }
+    }
+
+    const result = await setupFirstAdminAccount({
+      email,
+      password,
+      name,
+      phone,
+      role,
+      forceUpdate: Boolean(forceUpdate)
+    });
+
+    res.status(result.action === 'created' ? 201 : 200).json({
+      success: result.initialized || result.action === 'already_exists',
+      ...result
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message || 'Failed to execute admin setup' });
+  }
+});
+
+/**
+ * Admin Verification Endpoint
+ * Validates admin status and credentials using bcrypt hash comparison.
+ * Supports verifying credentials ({ email, password }) or verifying an existing Bearer token.
+ */
+app.post('/api/admin/verify', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    logAuthDiagnostic(req, 'Admin Verify');
+    const { email, password, token } = req.body || {};
+    const authHeader = req.headers.authorization;
+    const providedToken = token || (authHeader?.startsWith('Bearer ') ? authHeader.substring(7) : null);
+
+    // 1. Token-based verification
+    if (providedToken) {
+      const decoded = verifyToken(providedToken);
+      if (!decoded) {
+        return res.status(401).json({
+          valid: false,
+          error: 'Umwirondoro w\'ubuyobozi (Token) warataye agaciro cyangwa si wo (Invalid or expired token)'
+        });
+      }
+
+      const user = db.prepare('SELECT id, name, email, role, phone, avatar_url, is_disabled FROM users WHERE id = ?').get(decoded.id) as any;
+      if (!user) {
+        return res.status(401).json({ valid: false, error: 'Umukoresha ntakiboneka muri sisitemu' });
+      }
+
+      if (user.is_disabled) {
+        return res.status(403).json({ valid: false, error: 'Konti yahagaritswe n\'ubuyobozi (Account disabled)' });
+      }
+
+      if (!isUserAdmin(user.role)) {
+        return res.status(403).json({ valid: false, error: 'Konti ntabwo ifite uburenganzira bwa Admin (Not an admin role)' });
+      }
+
+      return res.json({
+        valid: true,
+        method: 'token',
+        user: {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          phone: user.phone || '',
+          avatar_url: user.avatar_url || ''
+        }
+      });
+    }
+
+    // 2. Credential-based verification using bcrypt hash comparison
+    if (!email || !password) {
+      return res.status(400).json({
+        valid: false,
+        error: 'Imeli n\'ijambo ry\'ibanga birakenewe kugira ngo hemezwe ubuyobozi'
+      });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const user = db.prepare('SELECT * FROM users WHERE LOWER(TRIM(email)) = ?').get(cleanEmail) as any;
+    if (!user) {
+      return res.status(401).json({
+        valid: false,
+        error: 'Imeli ntabwo ibarizwa mu bayobozi (Admin account not found)'
+      });
+    }
+
+    // Ensure stored Admin password is compared using bcrypt.compare()
+    let isMatch = false;
+    let needsRehash = false;
+
+    if (user.password_hash) {
+      const isBcrypt =
+        (user.password_hash.startsWith('$2a$') || user.password_hash.startsWith('$2b$') || user.password_hash.startsWith('$2y$')) &&
+        user.password_hash.length === 60;
+
+      if (isBcrypt) {
+        // Direct bcrypt.compare()
+        isMatch = await bcrypt.compare(String(password), user.password_hash);
+      } else {
+        const comp = await comparePassword(String(password), user.password_hash);
+        isMatch = comp.isMatch;
+        needsRehash = comp.needsRehash;
+      }
+    }
+
+    if (!isMatch) {
+      return res.status(401).json({
+        valid: false,
+        error: 'Ijambo ry\'ibanga si ryo (Incorrect admin password)'
+      });
+    }
+
+    if (needsRehash) {
+      const upgradedHash = hashPassword(String(password));
+      db.prepare('UPDATE users SET password_hash = ? WHERE id = ?').run(upgradedHash, user.id);
+    }
+
+    if (user.is_disabled) {
+      return res.status(403).json({
+        valid: false,
+        error: 'Konti y\'uyu muyobozi yahagaritswe (Account disabled)'
+      });
+    }
+
+    if (!isUserAdmin(user.role)) {
+      return res.status(403).json({
+        valid: false,
+        error: 'Konti ntabwo ifite uburenganzira bwa Admin (Insufficient privileges)'
+      });
+    }
+
+    return res.json({
+      valid: true,
+      method: 'bcrypt_credentials',
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        phone: user.phone || '',
+        avatar_url: user.avatar_url || ''
+      }
+    });
+  } catch (err: any) {
+    return res.status(500).json({ valid: false, error: err.message || 'Verification failed' });
+  }
+});
+
+app.get('/api/auth/me', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const user = db.prepare(`
+      SELECT id, name, email, phone, role, avatar_url, choir_voice, choir_role, bio,
+             share_directory, share_phone, share_email, share_whatsapp, created_at
+      FROM users
+      WHERE id = ?
+    `).get(req.user!.id) as any;
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    const favoritesCount = db.prepare('SELECT COUNT(*) as count FROM favorites WHERE user_id = ?').get(req.user!.id) as any;
+    const donationsCount = db.prepare("SELECT COUNT(*) as count, COALESCE(SUM(amount), 0) as total FROM payment_transactions WHERE user_id = ? AND status = 'successful'").get(req.user!.id) as any;
+
+    res.json({
+      user,
+      stats: {
+        favoritesCount: favoritesCount?.count || 0,
+        donationsCount: donationsCount?.count || 0,
+        totalDonated: donationsCount?.total || 0
+      }
+    });
+  } catch (err: any) {
+    console.error('Error in /api/auth/me:', err);
+    res.status(500).json({ error: 'Failed to fetch user profile', details: err?.message });
+  }
+});
+
+app.put('/api/auth/profile', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const {
+      name,
+      phone,
+      avatar_url,
+      choir_voice,
+      choir_role,
+      bio,
+      share_directory,
+      share_phone,
+      share_email,
+      share_whatsapp
+    } = req.body;
+
+    db.prepare(`
+      UPDATE users
+      SET name = COALESCE(?, name),
+          phone = COALESCE(?, phone),
+          avatar_url = COALESCE(?, avatar_url),
+          choir_voice = COALESCE(?, choir_voice),
+          choir_role = COALESCE(?, choir_role),
+          bio = COALESCE(?, bio),
+          share_directory = CASE WHEN ? IS NOT NULL THEN ? ELSE share_directory END,
+          share_phone = CASE WHEN ? IS NOT NULL THEN ? ELSE share_phone END,
+          share_email = CASE WHEN ? IS NOT NULL THEN ? ELSE share_email END,
+          share_whatsapp = CASE WHEN ? IS NOT NULL THEN ? ELSE share_whatsapp END,
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      name,
+      phone,
+      avatar_url,
+      choir_voice,
+      choir_role,
+      bio,
+      share_directory !== undefined ? (share_directory ? 1 : 0) : null,
+      share_directory !== undefined ? (share_directory ? 1 : 0) : null,
+      share_phone !== undefined ? (share_phone ? 1 : 0) : null,
+      share_phone !== undefined ? (share_phone ? 1 : 0) : null,
+      share_email !== undefined ? (share_email ? 1 : 0) : null,
+      share_email !== undefined ? (share_email ? 1 : 0) : null,
+      share_whatsapp !== undefined ? (share_whatsapp ? 1 : 0) : null,
+      share_whatsapp !== undefined ? (share_whatsapp ? 1 : 0) : null,
+      req.user!.id
+    );
+
+    const updated = db.prepare(`
+      SELECT id, name, email, phone, role, avatar_url, choir_voice, choir_role, bio,
+             share_directory, share_phone, share_email, share_whatsapp
+      FROM users
+      WHERE id = ?
+    `).get(req.user!.id);
+
+    res.json({ message: 'Umwirondoro n\'amahitamo byavuguruwe (Profile and privacy preferences updated)', user: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update profile' });
+  }
+});
+
+app.post('/api/auth/change-password', requireAuth, async (req: AuthRequest, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword || newPassword.length < 6) {
+      return res.status(400).json({ error: 'Ijambo ry\'ibanga rishya rigomba kugira byibuze inyuguti 6' });
+    }
+
+    const user = db.prepare('SELECT password_hash FROM users WHERE id = ?').get(req.user!.id) as any;
+    let isMatch = false;
+
+    if (user?.password_hash) {
+      const isBcrypt =
+        (user.password_hash.startsWith('$2a$') || user.password_hash.startsWith('$2b$') || user.password_hash.startsWith('$2y$')) &&
+        user.password_hash.length === 60;
+
+      if (isBcrypt) {
+        isMatch = await bcrypt.compare(currentPassword, user.password_hash);
+      } else {
+        const comp = await comparePassword(currentPassword, user.password_hash);
+        isMatch = comp.isMatch;
+      }
+    }
+
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Ijambo ry\'ibanga ry\'ubu si ryo' });
+    }
+
+    const newHash = hashPassword(newPassword);
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newHash, req.user!.id);
+
+    res.json({ message: 'Ijambo ry\'ibanga ryahinduwe neza (Password changed successfully)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to change password' });
+  }
+});
+
+// Account deletion (Required by Google Play & Apple App Store guidelines!)
+app.delete('/api/auth/delete-account', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    // Log audit
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'ACCOUNT_DELETED', 'users', ?)")
+      .run('log_' + Date.now(), userId, 'User requested account deletion');
+
+    // Cascade deletion removes user, comments, favorites, notifications
+    db.prepare('DELETE FROM users WHERE id = ?').run(userId);
+    res.json({ message: 'Konti yawe yasibwe burundu (Account deleted permanently)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+});
+
+// -------------------------------------------------------------
+// SECURE PASSWORD RECOVERY & ACCOUNT IDENTIFIER RECOVERY API
+// -------------------------------------------------------------
+
+// In-memory rate limiter for password reset requests to prevent abuse
+const resetRateLimiter = new Map<string, { count: number; firstRequestTime: number }>();
+function checkResetRateLimit(key: string, maxAttempts = 5, windowMs = 15 * 60 * 1000): boolean {
+  const now = Date.now();
+  const record = resetRateLimiter.get(key);
+  if (!record) {
+    resetRateLimiter.set(key, { count: 1, firstRequestTime: now });
+    return true;
+  }
+  if (now - record.firstRequestTime > windowMs) {
+    resetRateLimiter.set(key, { count: 1, firstRequestTime: now });
+    return true;
+  }
+  if (record.count >= maxAttempts) {
+    return false;
+  }
+  record.count += 1;
+  return true;
+}
+
+/**
+ * 1. Request Password Reset Link
+ * - Time-limited, single-use cryptographically secure token
+ * - Generic response prevents email enumeration attacks
+ * - Rate-limited to prevent abuse
+ */
+app.post('/api/auth/forgot-password', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const { email } = req.body || {};
+    const clientIp = (req.headers['x-forwarded-for'] as string) || req.socket.remoteAddress || 'unknown_ip';
+
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
+      return res.status(400).json({
+        success: false,
+        error: 'Imeyili yemewe irakenewe (A valid email address is required)'
+      });
+    }
+
+    const cleanEmail = email.trim().toLowerCase();
+    const rateLimitKey = `${clientIp}_${cleanEmail}`;
+
+    if (!checkResetRateLimit(rateLimitKey)) {
+      return res.status(429).json({
+        success: false,
+        error: 'Mwagerageje kenshi cyane. Nyamuneka tegereza iminota 15 mbere yo kongera gusaba (Too many attempts. Please try again after 15 minutes)'
+      });
+    }
+
+    // Generic response message - never reveals whether email exists in the system
+    const genericSuccessMessage = "Niba iyi imeyili ifite konti muri sisitemu, amabwiriza yo gusubiramo ijambo ry'ibanga yoherejwe kuri imeyili yawe. Reba no muri spam. (If this email is registered, password reset instructions have been sent.)";
+
+    // Query user record
+    const user = db.prepare('SELECT id, name, email, role, is_disabled FROM users WHERE LOWER(TRIM(email)) = ?').get(cleanEmail) as any;
+
+    if (!user || user.is_disabled) {
+      // Artificial delay to prevent timing attack enumeration
+      await new Promise(resolve => setTimeout(resolve, 250));
+      return res.status(200).json({
+        success: true,
+        message: genericSuccessMessage
+      });
+    }
+
+    // Invalidate previous unused reset tokens for this user
+    db.prepare('UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0').run(user.id);
+
+    // Generate secure, time-limited JWT reset token (1 hour expiry)
+    const jwtResetToken = generatePasswordResetToken({ id: user.id, email: cleanEmail });
+    const tokenHash = crypto.createHash('sha256').update(jwtResetToken).digest('hex');
+    const resetId = `rst_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+    // Set expiration to exactly 1 hour from now (in UTC ISO format for SQLite compatibility)
+    const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+    db.prepare(`
+      INSERT INTO password_resets (id, user_id, email, token_hash, expires_at, used, ip_address, created_at)
+      VALUES (?, ?, ?, ?, ?, 0, ?, CURRENT_TIMESTAMP)
+    `).run(resetId, user.id, cleanEmail, tokenHash, expiresAt, clientIp);
+
+    // Resolve base application URL for production on Render or local dev
+    const configuredAppUrl = process.env.APP_URL || process.env.RENDER_EXTERNAL_URL;
+    let baseUrl = configuredAppUrl;
+    if (!baseUrl) {
+      const proto = req.headers['x-forwarded-proto'] || req.protocol || 'http';
+      const host = req.headers['x-forwarded-host'] || req.get('host') || 'localhost:3000';
+      baseUrl = `${proto}://${host}`;
+    }
+    baseUrl = baseUrl.replace(/\/+$/, '');
+
+    const resetUrl = `${baseUrl}/?reset_token=${jwtResetToken}&email=${encodeURIComponent(cleanEmail)}`;
+
+    console.log(`[Password Reset] Generated secure JWT reset token for ${cleanEmail}. Link expires in 60 minutes.`);
+
+    // Trigger email service (real SMTP or placeholder service)
+    await sendPasswordResetEmail({
+      toEmail: cleanEmail,
+      recipientName: user.name,
+      resetUrl,
+      expiresInMinutes: 60
+    });
+
+    if (process.env.NODE_ENV !== 'production') {
+      return res.status(200).json({
+        success: true,
+        message: genericSuccessMessage,
+        devResetUrl: resetUrl,
+        isDevFallback: !isEmailServiceConfigured()
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      message: genericSuccessMessage
+    });
+  } catch (err: any) {
+    console.error('[Forgot Password Error]:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Habaye ikosa mu gutunganya ubusabe bwawe. Ongera ugerageze mukanya.'
+    });
+  }
+});
+
+/**
+ * 2. Verify Password Reset Token Validity
+ */
+app.post('/api/auth/verify-reset-token', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const { token, email } = req.body || {};
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({ valid: false, error: 'Token irakenewe' });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
+    const record = db.prepare(`
+      SELECT pr.*, u.name, u.email as user_email
+      FROM password_resets pr
+      JOIN users u ON pr.user_id = u.id
+      WHERE pr.token_hash = ? AND pr.used = 0
+    `).get(tokenHash) as any;
+
+    if (!record) {
+      return res.status(400).json({
+        valid: false,
+        error: 'Iyi link yo gusubiramo ijambo ry\'ibanga ntiyemewe cyangwa yarakoreshejwe (Invalid or already used token).'
+      });
+    }
+
+    const expiresAt = new Date(record.expires_at).getTime();
+    if (Date.now() > expiresAt) {
+      return res.status(400).json({
+        valid: false,
+        error: 'Iyi link yarengeje igihe cyayo cy\'agaciro (Token has expired). Saba indi nshya.'
+      });
+    }
+
+    return res.status(200).json({
+      valid: true,
+      message: 'Token iremewe (Valid token)',
+      email: record.user_email,
+      name: record.name
+    });
+  } catch (err: any) {
+    return res.status(500).json({ valid: false, error: 'Failed to verify token' });
+  }
+});
+
+/**
+ * 3. Complete Password Reset
+ * - Validates single-use token and expiration
+ * - Hashes new password securely with bcrypt
+ * - Invalidates token and all older pending tokens
+ * - Old password can no longer be used
+ */
+app.post('/api/auth/reset-password', async (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const { token, newPassword } = req.body || {};
+
+    if (!token || typeof token !== 'string') {
+      return res.status(400).json({
+        success: false,
+        error: 'Token yo gusubiramo ijambo ry\'ibanga irakenewe (Reset token is required)'
+      });
+    }
+
+    if (!newPassword || typeof newPassword !== 'string' || newPassword.length < 6) {
+      return res.status(400).json({
+        success: false,
+        error: 'Ijambo ry\'ibanga rishya rigomba kugira byibuze inyuguti 6 (Password must be at least 6 characters)'
+      });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(token.trim()).digest('hex');
+    const record = db.prepare(`
+      SELECT pr.*, u.id as user_id, u.name, u.email as user_email, u.role
+      FROM password_resets pr
+      JOIN users u ON pr.user_id = u.id
+      WHERE pr.token_hash = ? AND pr.used = 0
+    `).get(tokenHash) as any;
+
+    if (!record) {
+      return res.status(400).json({
+        success: false,
+        error: 'Iyi link yo gusubiramo ijambo ry\'ibanga ntiyemewe cyangwa yarakoreshejwe (Invalid or already used token). Nyamuneka saba indi nshya.'
+      });
+    }
+
+    const expiresAt = new Date(record.expires_at).getTime();
+    if (Date.now() > expiresAt) {
+      return res.status(400).json({
+        success: false,
+        error: 'Iyi link yarengeje igihe cyayo (Token has expired). Nyamuneka saba indi nshya.'
+      });
+    }
+
+    // Hash new password using bcrypt
+    const newPasswordHash = hashPassword(newPassword);
+
+    // Update user password and invalidate all tokens for this user in a transaction
+    db.exec('BEGIN TRANSACTION;');
+    try {
+      db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(newPasswordHash, record.user_id);
+
+      db.prepare('UPDATE password_resets SET used = 1, used_at = CURRENT_TIMESTAMP WHERE id = ?')
+        .run(record.id);
+
+      // Invalidate any other pending tokens
+      db.prepare('UPDATE password_resets SET used = 1 WHERE user_id = ? AND used = 0')
+        .run(record.user_id);
+
+      db.exec('COMMIT;');
+    } catch (txErr) {
+      db.exec('ROLLBACK;');
+      throw txErr;
+    }
+
+    logActivity(
+      record.user_id,
+      record.name,
+      record.role,
+      'PASSWORD_RESET',
+      'users',
+      record.user_id,
+      `User ${record.user_email} successfully reset password via secure single-use token`
+    );
+
+    console.log(`[Password Reset Complete] Successfully reset password for user ${record.user_email}. Single-use token invalidated.`);
+
+    return res.status(200).json({
+      success: true,
+      message: 'Ijambo ry\'ibanga ryahinduwe neza! Ushobora kwinjira muri konti yawe noneho (Password successfully updated. You can now sign in).'
+    });
+  } catch (err: any) {
+    console.error('[Reset Password Error]:', err);
+    return res.status(500).json({
+      success: false,
+      error: 'Habaye ikosa mu guhindura ijambo ry\'ibanga. Ongera ugerageze mukanya.'
+    });
+  }
+});
+
+/**
+ * 4. Forgotten Email or Username Recovery
+ * - Helps users who forgot their email address using a registered phone number
+ * - Never discloses complete registered email or details to an unauthenticated person
+ * - Stronger protection for Admin accounts: directs them to Choir Leadership
+ */
+app.post('/api/auth/forgot-identifier', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  try {
+    const { phone } = req.body || {};
+
+    if (!phone || typeof phone !== 'string' || phone.trim().length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: 'Nimero ya terefone yemewe irakenewe (Valid phone number required)'
+      });
+    }
+
+    const cleanPhone = phone.trim().replace(/\s+/g, '');
+    const phoneCandidates = [
+      cleanPhone,
+      cleanPhone.startsWith('0') ? '+250' + cleanPhone.substring(1) : cleanPhone,
+      cleanPhone.startsWith('+250') ? '0' + cleanPhone.substring(4) : cleanPhone,
+      cleanPhone.startsWith('250') ? '0' + cleanPhone.substring(3) : cleanPhone
+    ];
+
+    let user: any = null;
+    for (const p of phoneCandidates) {
+      user = db.prepare('SELECT id, name, email, phone, role, is_disabled FROM users WHERE phone = ?').get(p) as any;
+      if (user) break;
+    }
+
+    if (!user || user.is_disabled) {
+      return res.status(200).json({
+        success: false,
+        message: 'Nta konti ibonetse ifitanye isano n\'iyi nimero ya terefone. Niba ufite ikibazo cyo kwibagirwa imeyili yawe, mwavugana n\'ubuyobozi bwa Korali kuri lalumierechoir@gmail.com cyangwa kuri telefone y\'itorero.'
+      });
+    }
+
+    // Admin accounts receive stronger protection against unauthorized account recovery
+    if (isUserAdmin(user.role)) {
+      return res.status(200).json({
+        success: true,
+        isAdminAccount: true,
+        message: 'Konti y\'ubuyobozi ifite umutekano wihariye kandi ntiyemererwa kugaragaza imeyili muri ubu buryo. Nyamuneka vugana n\'Umuyobozi Mukuru wa Korali cyangwa wandikire ubuyobozi kuri lalumierechoir@gmail.com kugira ngo bagufashe kwemeza umwirondoro wawe.'
+      });
+    }
+
+    // Mask user's email so that the complete address is never disclosed
+    const parts = user.email.split('@');
+    const namePart = parts[0];
+    const domainPart = parts[1] || 'gmail.com';
+    let maskedName = '';
+    if (namePart.length <= 2) {
+      maskedName = `${namePart[0]}***`;
+    } else {
+      maskedName = `${namePart[0]}***${namePart[namePart.length - 1]}`;
+    }
+    const maskedEmail = `${maskedName}@${domainPart}`;
+
+    return res.status(200).json({
+      success: true,
+      maskedEmail,
+      message: `Konti yawe yarabonetse! Imeyili ikoreshwa ni: ${maskedEmail}. Koresha iyi meyili cyangwa ukande 'Gusubiramo Ijambo ry'Ibanga' niba wifuza irindi jambo ry'ibanga.`
+    });
+  } catch (err: any) {
+    return res.status(500).json({
+      success: false,
+      error: 'Habaye ikosa mu kureba umwirondoro wawe.'
+    });
+  }
+});
+
+// -------------------------------------------------------------
+// SONGS & DIGITAL SONGBOOK API
+// -------------------------------------------------------------
+app.get('/api/songs', optionalAuth, (req: AuthRequest, res) => {
+  try {
+    const { search, category, status, sort } = req.query;
+    let query = `
+      SELECT s.id, s.title, s.song_number, s.composer, s.category_id, s.release_status,
+             s.release_date, s.description, s.cover_image_url, s.views_count, s.display_order,
+             s.lyrics_pdf_url, s.lyrics_pdf_filename,
+             sc.name as category_name, sc.slug as category_slug,
+             (SELECT COUNT(*) FROM audio_tracks at WHERE at.song_id = s.id) as audio_count,
+             (SELECT COUNT(*) FROM comments c WHERE c.song_id = s.id AND c.status = 'visible') as comments_count
+      FROM songs s
+      LEFT JOIN song_categories sc ON s.category_id = sc.id
+      WHERE (s.is_deleted = 0 OR s.is_deleted IS NULL)
+        AND (s.status = 'published' OR s.status IS NULL)
+    `;
+    const params: any[] = [];
+
+    if (category && category !== 'all') {
+      query += ` AND (s.category_id = ? OR sc.slug = ?)`;
+      params.push(category, category);
+    }
+
+    if (status && status !== 'all') {
+      query += ` AND s.release_status = ?`;
+      params.push(status);
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (
+        s.title LIKE ? OR
+        s.composer LIKE ? OR
+        s.song_number LIKE ? OR
+        EXISTS (SELECT 1 FROM lyrics l WHERE l.song_id = s.id AND l.content LIKE ?)
+      )`;
+      params.push(term, term, term, term);
+    }
+
+    if (sort === 'popular') {
+      query += ` ORDER BY s.views_count DESC, s.display_order ASC`;
+    } else if (sort === 'number') {
+      query += ` ORDER BY CAST(s.song_number AS INTEGER) ASC, s.song_number ASC`;
+    } else if (sort === 'oldest') {
+      query += ` ORDER BY s.display_order ASC`;
+    } else {
+      // Default: original book display order
+      query += ` ORDER BY s.display_order ASC, s.id ASC`;
+    }
+
+    const songs = db.prepare(query).all(...params) as any[];
+
+    // Include favorite status if user is logged in
+    let favoriteSongIds = new Set<string>();
+    if (req.user) {
+      const userFavs = db.prepare('SELECT song_id FROM favorites WHERE user_id = ?').all(req.user.id) as any[];
+      favoriteSongIds = new Set(userFavs.map(f => f.song_id));
+    }
+
+    const result = songs.map(s => ({
+      ...s,
+      is_favorite: favoriteSongIds.has(s.id),
+      has_audio: Number(s.audio_count) > 0,
+      has_pdf: Boolean(s.lyrics_pdf_url),
+      lyrics_pdf_url: s.lyrics_pdf_url || null,
+      lyrics_pdf_filename: s.lyrics_pdf_filename || null,
+      is_unreleased: s.release_status === 'unreleased'
+    }));
+
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to query songs' });
+  }
+});
+
+app.get(['/api/songs/categories', '/api/categories'], (req, res) => {
+  try {
+    const categories = db.prepare(`
+      SELECT sc.*, COUNT(s.id) as song_count
+      FROM song_categories sc
+      LEFT JOIN songs s ON sc.id = s.category_id
+      GROUP BY sc.id
+      ORDER BY sc.display_order ASC
+    `).all();
+    res.json(categories);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch categories' });
+  }
+});
+
+// Parse the 16 songs JSON from the choir document text
+app.get('/api/songs/parse-16-songs', (req, res) => {
+  try {
+    const songs = parseSixteenSongs();
+    res.json({
+      success: true,
+      count: songs.length,
+      songs
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to parse 16 songs' });
+  }
+});
+
+// Upsert the 16 songs with title existence check to ensure zero duplicates
+app.post(['/api/songs/upsert-16-songs', '/api/admin/songs/upsert-16-songs'], optionalAuth, async (req: AuthRequest, res) => {
+  try {
+    const documentText = req.body && typeof req.body.text === 'string' && req.body.text.trim()
+      ? req.body.text
+      : undefined;
+
+    const result = upsertSixteenSongs(documentText, db);
+
+    if (req.user) {
+      logActivity(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'UPSERT_16_SONGS',
+        'songs',
+        'batch',
+        `Upserted 16 songs (inserted: ${result.report.insertedCount}, updated: ${result.report.updatedCount})`
+      );
+    }
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'sixteen_songs_upsert',
+      count: result.parsedCount,
+      insertedCount: result.report.insertedCount,
+      updatedCount: result.report.updatedCount,
+      skippedCount: result.report.skippedCount
+    });
+
+    res.json({
+      success: true,
+      message: `Hasuzumwe indirimbo ${result.parsedCount}. Hashyizwemo nshya: ${result.report.insertedCount}, Zavuguruwe: ${result.report.updatedCount}, Zasigaye: ${result.report.skippedCount}. Nta ndirimbo yasubiwemo (Zero duplicates created).`,
+      parsedCount: result.parsedCount,
+      report: result.report,
+      songs: result.songs
+    });
+  } catch (err: any) {
+    console.error('Error in upsert-16-songs endpoint:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu kwinjiza indirimbo 16' });
+  }
+});
+
+// Single song details with lyrics and audio tracks
+app.get('/api/songs/:id', optionalAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const song = db.prepare(`
+      SELECT s.*, sc.name as category_name
+      FROM songs s
+      LEFT JOIN song_categories sc ON s.category_id = sc.id
+      WHERE s.id = ?
+    `).get(id) as any;
+
+    if (!song) {
+      return res.status(404).json({ error: 'Indirimbo ntibonetse (Song not found)' });
+    }
+
+    const isAdmin = isUserAdmin(req.user?.role);
+
+    // If song is draft or soft-deleted, only admins can view it
+    if (!isAdmin && (song.is_deleted === 1 || song.status === 'draft')) {
+      return res.status(404).json({ error: 'Indirimbo ntibonetse cyangwa ntiyemerewe kurebwa (Song not found or draft)' });
+    }
+
+    // Increment view count
+    db.prepare('UPDATE songs SET views_count = views_count + 1 WHERE id = ?').run(id);
+
+    if (req.user) {
+      logActivity(req.user.id, req.user.name, req.user.role, 'SONG_ACCESS', 'songs', id, `Accessed hymn lyrics for "${song.title}"`);
+    }
+
+    const audioTracks = db.prepare('SELECT * FROM audio_tracks WHERE song_id = ? AND (is_deleted = 0 OR is_deleted IS NULL) ORDER BY created_at ASC').all(id) as any[];
+    const lyricsRow = db.prepare('SELECT * FROM lyrics WHERE song_id = ?').get(id) as any;
+
+    // Unreleased content protection
+    let lyricsContent = lyricsRow?.content || '';
+    let isLocked = false;
+
+    if (song.release_status === 'unreleased') {
+      // Check if unlocked in session or user has access grant
+      let hasAccess = isAdmin;
+      if (!hasAccess && req.user) {
+        const grant = db.prepare('SELECT id FROM protected_content_access WHERE song_id = ? AND user_id = ?').get(id, req.user.id);
+        if (grant) hasAccess = true;
+      }
+
+      if (!hasAccess) {
+        isLocked = true;
+        // Obscure lyrics completely for unreleased songs to unauthorized users
+        lyricsContent = '';
+      }
+    }
+
+    let isFavorite = false;
+    if (req.user) {
+      const fav = db.prepare('SELECT 1 FROM favorites WHERE user_id = ? AND song_id = ?').get(req.user.id, id);
+      isFavorite = Boolean(fav);
+    }
+
+    res.json({
+      ...song,
+      access_password_hash: undefined, // Never expose password hash!
+      is_locked: isLocked,
+      is_favorite: isFavorite,
+      lyrics: lyricsContent,
+      solfa_notation: isLocked ? null : lyricsRow?.solfa_notation,
+      language: lyricsRow?.language || 'rw',
+      audio_tracks: isLocked ? [] : audioTracks, // Audio also protected if unreleased and locked
+      available_track_count: audioTracks.length
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch song details' });
+  }
+});
+
+// Unlock unreleased song with access password
+app.post('/api/songs/:id/unlock', optionalAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { password } = req.body;
+
+    if (!password) {
+      return res.status(400).json({ error: 'Ijambo ry\'ibanga rirakenewe (Password required)' });
+    }
+
+    const song = db.prepare('SELECT id, release_status, access_password_hash FROM songs WHERE id = ?').get(id) as any;
+    if (!song) {
+      return res.status(404).json({ error: 'Song not found' });
+    }
+
+    if (song.release_status !== 'unreleased') {
+      return res.json({ message: 'Indirimbo irasohotse (Song is already public)' });
+    }
+
+    if (!song.access_password_hash || !bcrypt.compareSync(password, song.access_password_hash)) {
+      return res.status(401).json({ error: 'Ijambo ry\'ibanga si ryo (Incorrect access password)' });
+    }
+
+    // Grant access log
+    db.prepare('INSERT INTO protected_content_access (id, user_id, song_id) VALUES (?, ?, ?)')
+      .run('grant_' + Date.now(), req.user?.id || null, id);
+
+    const lyricsRow = db.prepare('SELECT * FROM lyrics WHERE song_id = ?').get(id) as any;
+    const audioTracks = db.prepare('SELECT * FROM audio_tracks WHERE song_id = ?').all(id);
+
+    res.json({
+      success: true,
+      message: 'Mwinjiye neza mu ndirimbo itarasohoka (Unlocked successfully)',
+      lyrics: lyricsRow?.content || '',
+      solfa_notation: lyricsRow?.solfa_notation,
+      audio_tracks: audioTracks
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to verify password' });
+  }
+});
+
+// -------------------------------------------------------------
+// AUDIO LIBRARY API
+// -------------------------------------------------------------
+const handleAudioLibraryRequest = (req: any, res: any) => {
+  try {
+    const { track_type, type, search } = req.query;
+    const filterType = track_type || type;
+    let query = `
+      SELECT at.*, s.title as song_title, s.song_number, s.composer, s.cover_image_url, s.release_status
+      FROM audio_tracks at
+      JOIN songs s ON at.song_id = s.id
+      WHERE s.release_status = 'released'
+    `;
+    const params: any[] = [];
+
+    if (filterType && filterType !== 'all') {
+      query += ` AND at.track_type = ?`;
+      params.push(filterType);
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      query += ` AND (at.title LIKE ? OR s.title LIKE ? OR s.composer LIKE ?)`;
+      const term = `%${search.trim()}%`;
+      params.push(term, term, term);
+    }
+
+    query += ` ORDER BY at.plays_count DESC, at.created_at DESC`;
+    const tracks = db.prepare(query).all(...params);
+    res.json(tracks);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch audio tracks' });
+  }
+};
+
+app.get('/api/audio-library', handleAudioLibraryRequest);
+app.get('/api/audio-tracks', handleAudioLibraryRequest);
+
+app.post('/api/audio-tracks/:id/play', (req, res) => {
+  try {
+    db.prepare('UPDATE audio_tracks SET plays_count = plays_count + 1 WHERE id = ?').run(req.params.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false });
+  }
+});
+
+// -------------------------------------------------------------
+// FAVORITES API
+// -------------------------------------------------------------
+app.get('/api/favorites', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const songs = db.prepare(`
+      SELECT s.*, sc.name as category_name, 1 as is_favorite
+      FROM favorites f
+      JOIN songs s ON f.song_id = s.id
+      LEFT JOIN song_categories sc ON s.category_id = sc.id
+      WHERE f.user_id = ?
+      ORDER BY f.created_at DESC
+    `).all(req.user!.id);
+    res.json(songs);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch favorites' });
+  }
+});
+
+app.post('/api/favorites/:songId', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const { songId } = req.params;
+    const userId = req.user!.id;
+
+    const existing = db.prepare('SELECT 1 FROM favorites WHERE user_id = ? AND song_id = ?').get(userId, songId);
+    if (existing) {
+      db.prepare('DELETE FROM favorites WHERE user_id = ? AND song_id = ?').run(userId, songId);
+      res.json({ is_favorite: false, message: 'Yakuwe mu ndirimbo ukunda (Removed from favorites)' });
+    } else {
+      db.prepare('INSERT INTO favorites (user_id, song_id) VALUES (?, ?)').run(userId, songId);
+      res.json({ is_favorite: true, message: 'Yongewe mu ndirimbo ukunda (Added to favorites)' });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update favorites' });
+  }
+});
+
+// -------------------------------------------------------------
+// COMMENTS & COMMUNITY API
+// -------------------------------------------------------------
+app.get('/api/songs/:id/comments', (req, res) => {
+  try {
+    const { id } = req.params;
+    const comments = db.prepare(`
+      SELECT c.*, u.name as user_name, u.avatar_url, u.role as user_role
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.song_id = ? AND c.status = 'visible' AND c.parent_id IS NULL
+      ORDER BY c.created_at DESC
+    `).all(id) as any[];
+
+    // Fetch replies for each comment
+    const getReplies = db.prepare(`
+      SELECT c.*, u.name as user_name, u.avatar_url, u.role as user_role
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.parent_id = ? AND c.status = 'visible'
+      ORDER BY c.created_at ASC
+    `);
+
+    const result = comments.map(c => ({
+      ...c,
+      replies: getReplies.all(c.id)
+    }));
+
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch comments' });
+  }
+});
+
+app.post('/api/songs/:id/comments', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { content, parent_id } = req.body;
+
+    if (!content || !content.trim()) {
+      return res.status(400).json({ error: 'Ubutumwa ntibushobora kuba ubusa (Comment cannot be empty)' });
+    }
+
+    // Basic spam prevention: check recent comments in last 10 seconds
+    const recent = db.prepare(`
+      SELECT COUNT(*) as count FROM comments
+      WHERE user_id = ? AND created_at >= datetime('now', '-10 seconds')
+    `).get(req.user!.id) as any;
+
+    if (recent && recent.count >= 2) {
+      return res.status(429).json({ error: 'Tegereza akanya gato mbere yo kongera kwandika igitekerezo (Please wait a moment)' });
+    }
+
+    const commentId = 'comm_' + Date.now();
+    db.prepare(`
+      INSERT INTO comments (id, song_id, user_id, parent_id, content, status)
+      VALUES (?, ?, ?, ?, ?, 'visible')
+    `).run(commentId, id, req.user!.id, parent_id || null, content.trim());
+
+    const created = db.prepare(`
+      SELECT c.*, u.name as user_name, u.avatar_url, u.role as user_role
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      WHERE c.id = ?
+    `).get(commentId);
+
+    res.status(201).json({ message: 'Igitekerezo cyakiriwe (Comment posted)', comment: created });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to post comment' });
+  }
+});
+
+app.post('/api/comments/:id/like', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.user!.id;
+
+    const existing = db.prepare("SELECT 1 FROM comment_reactions WHERE user_id = ? AND comment_id = ? AND reaction_type = 'like'").get(userId, id);
+    if (existing) {
+      db.prepare("DELETE FROM comment_reactions WHERE user_id = ? AND comment_id = ? AND reaction_type = 'like'").run(userId, id);
+      db.prepare('UPDATE comments SET likes_count = MAX(0, likes_count - 1) WHERE id = ?').run(id);
+      return res.json({ liked: false });
+    } else {
+      db.prepare("INSERT INTO comment_reactions (user_id, comment_id, reaction_type) VALUES (?, ?, 'like')").run(userId, id);
+      db.prepare('UPDATE comments SET likes_count = likes_count + 1 WHERE id = ?').run(id);
+      return res.json({ liked: true });
+    }
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to react to comment' });
+  }
+});
+
+app.post('/api/comments/:id/report', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { reason } = req.body;
+    const userId = req.user!.id;
+
+    db.prepare(`
+      INSERT OR IGNORE INTO comment_reactions (user_id, comment_id, reaction_type, reason)
+      VALUES (?, ?, 'report', ?)
+    `).run(userId, id, reason || 'Inappropriate content');
+
+    db.prepare('UPDATE comments SET reports_count = reports_count + 1 WHERE id = ?').run(id);
+
+    // If reported 3 or more times, auto-flag for moderation
+    const c = db.prepare('SELECT reports_count FROM comments WHERE id = ?').get(id) as any;
+    if (c && c.reports_count >= 3) {
+      db.prepare("UPDATE comments SET status = 'flagged' WHERE id = ?").run(id);
+    }
+
+    res.json({ message: 'Icyegeranyo cyakiriwe, ubuyobozi buragisuzuma (Report submitted)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to submit report' });
+  }
+});
+
+// -------------------------------------------------------------
+// RWANDA MOBILE MONEY DONATIONS & DIRECT PAYMENT GATEWAY API
+// -------------------------------------------------------------
+app.use('/api/payments', paymentsRouter);
+
+app.get('/api/payment-providers', (req, res) => {
+  try {
+    const providers = db.prepare('SELECT id, name, slug, is_enabled, environment, merchant_account_id FROM payment_providers WHERE is_enabled = 1').all();
+    res.json(providers);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch payment providers' });
+  }
+});
+
+// Public donation & recipient settings
+app.get('/api/donations/settings', (req, res) => {
+  try {
+    const settings = getMomoDonationSettings();
+    const gatewayStatus = RwandaPaymentGatewayService.getGatewayStatus();
+    res.json({
+      settings: {
+        recipient_name: settings.recipient_name,
+        recipient_phone: settings.phone_number,
+        donation_purpose: settings.purpose,
+        title: settings.title,
+        intro_message: settings.intro_message,
+        payment_instructions: settings.instructions,
+        min_amount: settings.min_amount || 100,
+        max_amount: settings.max_amount || 5000000,
+        is_enabled: settings.is_enabled,
+        supported_methods: settings.supported_methods || ['mtn-momo', 'airtel-money'],
+        last_updated: settings.updated_at,
+      },
+      gateway: gatewayStatus,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch donation settings' });
+  }
+});
+
+app.post('/api/donations/validate-phone', (req, res) => {
+  const { phone } = req.body;
+  const result = validateAndNormalizeRwandaPhone(phone);
+  res.json({
+    valid: result.isValid,
+    carrier: result.carrier,
+    formatted: result.formatted10,
+    formattedInternational: result.formatted12,
+    error: result.errorMessage,
+  });
+});
+
+app.post('/api/donations/initiate', optionalAuth, async (req: AuthRequest, res) => {
+  try {
+    const {
+      amount,
+      phone,
+      phoneNumber: rawPhoneNumber,
+      phone_number,
+      donor_phone,
+      donorPhone,
+      customerPhone,
+      payerPhone,
+      number,
+      paymentMethod,
+      provider_slug,
+      donationPurpose,
+      donation_purpose,
+      donorName,
+      donor_name,
+      donorEmail,
+      donor_email,
+      isAnonymous,
+      is_anonymous,
+      idempotency_key,
+    } = req.body;
+
+    // Check if donations are globally enabled by Admin
+    const currentSettings = getMomoDonationSettings();
+    if (!currentSettings.is_enabled) {
+      return res.status(403).json({
+        error: 'Kwakira impano n\'inkunga byahagaritswe by\'agateganyo n\'ubuyobozi (Online donations are temporarily paused).',
+      });
+    }
+
+    const rawDonorPhone =
+      phone ||
+      rawPhoneNumber ||
+      phone_number ||
+      donor_phone ||
+      donorPhone ||
+      customerPhone ||
+      payerPhone ||
+      req.body.customer?.phone ||
+      req.body.payer?.phone ||
+      number;
+
+    const phoneNumber = typeof rawDonorPhone === 'string' ? rawDonorPhone.trim() : (rawDonorPhone ? String(rawDonorPhone).trim() : '');
+
+    // 1. Missing phone validation
+    if (!phoneNumber) {
+      return res.status(400).json({
+        error: 'Nyamuneka shyiramo nimero ya telefone yo kwishyuriraho (Please enter the phone number you will use to make this payment).',
+      });
+    }
+
+    // 2. Rwanda phone format & carrier validation
+    const phoneCheck = validateAndNormalizeRwandaPhone(phoneNumber);
+    if (!phoneCheck.isValid) {
+      return res.status(400).json({
+        error: phoneCheck.errorMessage || "Nyamuneka shyiramo nimero ya telefone y'u Rwanda yemewe (Please enter a valid Rwanda mobile phone number).",
+      });
+    }
+
+    const provider = provider_slug || paymentMethod || (phoneCheck.carrier === 'Airtel' ? 'airtel-money' : 'mtn-momo');
+    const purpose = donationPurpose || donation_purpose || currentSettings.purpose;
+    const name = donorName || donor_name || req.user?.name || 'Umugiraneza';
+    const email = donorEmail || donor_email || req.user?.email || null;
+    const anonymous = isAnonymous !== undefined ? isAnonymous : is_anonymous;
+    const parsedAmount = Number(amount);
+
+    if (isNaN(parsedAmount) || parsedAmount < (currentSettings.min_amount || 100)) {
+      return res.status(400).json({
+        error: `Amafaranga ntashobora kuba munsi ya ${(currentSettings.min_amount || 100).toLocaleString()} RWF (Minimum donation is ${(currentSettings.min_amount || 100).toLocaleString()} RWF)`,
+      });
+    }
+
+    if (parsedAmount > (currentSettings.max_amount || 5000000)) {
+      return res.status(400).json({
+        error: `Amafaranga ntashobora kurenga ${(currentSettings.max_amount || 5000000).toLocaleString()} RWF (Maximum donation is ${(currentSettings.max_amount || 5000000).toLocaleString()} RWF)`,
+      });
+    }
+
+    const response = await RwandaPaymentGatewayService.initiatePayment({
+      userId: req.user?.id,
+      donorName: name,
+      phone: phoneCheck.formatted10,
+      donorEmail: email,
+      amount: parsedAmount,
+      paymentMethod: provider === 'airtel-money' ? 'airtel-money' : 'mtn-momo',
+      donationPurpose: purpose,
+      isAnonymous: Boolean(anonymous),
+      idempotencyKey: idempotency_key,
+    });
+
+    // Realtime notification to admin/connected clients
+    broadcastRealtimeEvent('donation_updated', {
+      transaction: response.transaction,
+      type: 'INITIATED',
+    });
+
+    res.json(response);
+  } catch (err: any) {
+    console.error('[API /api/donations/initiate error]:', err.message);
+    res.status(400).json({ error: err.message || 'Ntibyakunze gutangiza ubwishyu' });
+  }
+});
+
+const handleVerifyDonationStatus = async (req: any, res: any) => {
+  try {
+    const identifier = req.params.reference || req.params.id;
+    const transaction = await RwandaPaymentGatewayService.verifyPaymentStatus(identifier);
+    res.json(transaction);
+  } catch (err: any) {
+    res.status(404).json({ error: err.message || 'Transaction not found' });
+  }
+};
+
+app.get('/api/donations/verify/:id', handleVerifyDonationStatus);
+app.get('/api/donations/status/:reference', handleVerifyDonationStatus);
+app.get('/api/donations/:reference/status', handleVerifyDonationStatus);
+
+app.get('/api/donations/history', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const donations = db.prepare(`
+      SELECT id, internal_reference, provider_reference, amount, currency,
+             provider_slug, donation_purpose, status, created_at, completed_at
+      FROM payment_transactions
+      WHERE user_id = ?
+      ORDER BY created_at DESC
+    `).all(req.user!.id);
+    res.json(donations);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch donations history' });
+  }
+});
+
+// Official Payment Webhook Handler (Paypack & Direct Rwanda Gateways)
+const handleIncomingWebhook = (req: express.Request, res: express.Response) => {
+  try {
+    const rawBody = (req as any).rawBody || JSON.stringify(req.body);
+    const result = RwandaPaymentGatewayService.handleWebhook(req.headers, rawBody, req.body);
+
+    if (result.transaction) {
+      broadcastRealtimeEvent('donation_updated', {
+        transaction: result.transaction,
+        type: 'STATUS_CHANGED',
+      });
+    }
+
+    res.status(200).json({ status: 'ok', received: true });
+  } catch (err: any) {
+    console.error('[Webhook processing error]:', err.message);
+    res.status(400).json({ error: err.message || 'Webhook verification failed' });
+  }
+};
+
+app.post('/api/payments/webhook', handleIncomingWebhook);
+app.post('/api/donations/callback', handleIncomingWebhook);
+
+// -------------------------------------------------------------
+// ATTENDANCE, ANNOUNCEMENTS & EVENT REMINDERS ROUTERS
+// -------------------------------------------------------------
+app.use('/api/attendance', attendanceRouter);
+app.use('/api/announcements', announcementsRouter);
+app.use('/api/admin/announcements', announcementsRouter);
+app.use('/api/reminders', remindersRouter);
+
+app.get('/api/notifications', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const notifications = db.prepare(`
+      SELECT * FROM notifications
+      WHERE user_id = ? OR user_id IS NULL
+      ORDER BY created_at DESC
+      LIMIT 30
+    `).all(req.user!.id);
+    res.json(notifications);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch notifications' });
+  }
+});
+
+app.put('/api/notifications/:id/read', requireAuth, (req: AuthRequest, res) => {
+  try {
+    db.prepare('UPDATE notifications SET is_read = 1 WHERE id = ? AND (user_id = ? OR user_id IS NULL)').run(req.params.id, req.user!.id);
+    res.json({ success: true });
+  } catch (err) {
+    res.json({ success: false });
+  }
+});
+
+// -------------------------------------------------------------
+// ABOUT CHOIR
+// -------------------------------------------------------------
+app.get('/api/about', (req, res) => {
+  try {
+    const settings = db.prepare('SELECT key, value FROM app_settings').all() as any[];
+    const map: Record<string, string> = {};
+    settings.forEach(s => { map[s.key] = s.value; });
+
+    res.json({
+      choir_name: map.choir_name || 'La Lumiere Choir',
+      affiliation: map.church_affiliation || 'ADEPR Nyanza, Kicukiro District, Rwanda',
+      about_story: map.about_story || '',
+      mission: map.mission_statement || '',
+      vision: map.vision_statement || '',
+      contact_phone: map.contact_phone || '+250 788 000 000',
+      contact_email: map.contact_email || 'info@lalumierechoir.rw',
+      socials: {
+        youtube: 'https://youtube.com/@LaLumiereChoir',
+        instagram: 'https://instagram.com/lalumierechoir',
+        facebook: 'https://facebook.com/lalumierechoir'
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch choir about info' });
+  }
+});
+
+// -------------------------------------------------------------
+// PUBLIC CONTENT ENDPOINTS (Events, Documents, Articles)
+// -------------------------------------------------------------
+// -------------------------------------------------------------
+// PUBLIC & USER EVENTS ENDPOINTS (Upcoming Events & Interests)
+// -------------------------------------------------------------
+app.get('/api/events', optionalAuth, (req: AuthRequest, res) => {
+  try {
+    const { category, search, upcoming_only, all } = req.query;
+    const currentUserId = req.user?.id || null;
+
+    let query = `
+      SELECT e.*,
+             (SELECT COUNT(*) FROM event_interested ei WHERE ei.event_id = e.id) as interested_count,
+             CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM event_interested ei WHERE ei.event_id = e.id AND ei.user_id = ?) THEN 1 ELSE 0 END as is_interested
+      FROM events e
+      WHERE (e.is_deleted = 0 OR e.is_deleted IS NULL)
+    `;
+    const params: any[] = [currentUserId, currentUserId];
+
+    if (all !== 'true') {
+      // By default public sees only published, non-cancelled events
+      query += ` AND (e.status = 'published' OR e.status IS NULL) AND (e.event_status != 'cancelled' OR e.event_status IS NULL)`;
+    }
+
+    if (category && category !== 'all') {
+      query += ` AND LOWER(e.category) = LOWER(?)`;
+      params.push(String(category).trim());
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (e.title LIKE ? OR e.location LIKE ? OR e.description LIKE ? OR e.category LIKE ?)`;
+      params.push(term, term, term, term);
+    }
+
+    if (upcoming_only !== 'false') {
+      // Display events from yesterday onwards or with upcoming/ongoing status
+      query += ` AND (e.event_status IN ('upcoming', 'ongoing') OR e.event_date >= DATE('now', '-1 day'))`;
+    }
+
+    query += ` ORDER BY e.event_date ASC, COALESCE(e.start_time, '00:00') ASC`;
+
+    const events = db.prepare(query).all(...params) as any[];
+
+    const formattedEvents = events.map(e => ({
+      ...e,
+      interested_count: Number(e.interested_count || 0),
+      is_interested: Boolean(e.is_interested),
+    }));
+
+    res.json(formattedEvents);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch events' });
+  }
+});
+
+app.get('/api/events/categories', (req, res) => {
+  try {
+    const standardCategories = [
+      { name: 'Choir Practice', name_rw: 'Imyitozo ya Korali' },
+      { name: 'Ministry Event', name_rw: 'Ivugabutumwa & Amavuna' },
+      { name: 'Special Performance', name_rw: 'Ibitaramo Byihariye' },
+      { name: 'Concert', name_rw: 'Ibitaramo Bikomeye (Concerts)' },
+      { name: 'Worship Night', name_rw: 'Ijoro ryo Kuramya' },
+      { name: 'Fellowship', name_rw: 'Ubusabane & Amateraniro' },
+    ];
+
+    const counts = db.prepare(`
+      SELECT category, COUNT(*) as count
+      FROM events
+      WHERE (is_deleted = 0 OR is_deleted IS NULL)
+        AND (status = 'published' OR status IS NULL)
+        AND (event_status != 'cancelled' OR event_status IS NULL)
+      GROUP BY category
+    `).all() as any[];
+
+    const countMap = new Map(counts.map(c => [String(c.category || '').toLowerCase(), c.count]));
+
+    const categoriesWithCount = standardCategories.map(cat => ({
+      ...cat,
+      count: countMap.get(cat.name.toLowerCase()) || 0,
+    }));
+
+    res.json(categoriesWithCount);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch event categories' });
+  }
+});
+
+app.get('/api/events/user-interests', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const userId = req.user!.id;
+    const rows = db.prepare('SELECT event_id FROM event_interested WHERE user_id = ?').all(userId) as any[];
+    res.json({ event_ids: rows.map(r => r.event_id) });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch user event interests' });
+  }
+});
+
+app.get('/api/events/:id', optionalAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const currentUserId = req.user?.id || null;
+    const isAdmin = isUserAdmin(req.user?.role);
+
+    const event = db.prepare(`
+      SELECT e.*,
+             (SELECT COUNT(*) FROM event_interested ei WHERE ei.event_id = e.id) as interested_count,
+             CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM event_interested ei WHERE ei.event_id = e.id AND ei.user_id = ?) THEN 1 ELSE 0 END as is_interested
+      FROM events e
+      WHERE e.id = ? AND (e.is_deleted = 0 OR e.is_deleted IS NULL)
+    `).get(currentUserId, currentUserId, id) as any;
+
+    if (!event) {
+      return res.status(404).json({ error: 'Igikorwa ntikibonetse (Event not found)' });
+    }
+
+    event.interested_count = Number(event.interested_count || 0);
+    event.is_interested = Boolean(event.is_interested);
+
+    if (isAdmin) {
+      event.interested_users = db.prepare(`
+        SELECT u.id as user_id, u.name, u.email, u.phone, u.avatar_url, u.role, u.choir_voice, ei.created_at
+        FROM event_interested ei
+        JOIN users u ON ei.user_id = u.id
+        WHERE ei.event_id = ?
+        ORDER BY ei.created_at DESC
+      `).all(id);
+    }
+
+    res.json(event);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch event details' });
+  }
+});
+
+app.post('/api/events/:id/interest', requireAuth, (req: AuthRequest, res) => {
+  try {
+    const { id: eventId } = req.params;
+    const userId = req.user!.id;
+    const { interested } = req.body;
+
+    const event = db.prepare('SELECT id, title FROM events WHERE id = ? AND (is_deleted = 0 OR is_deleted IS NULL)').get(eventId) as any;
+    if (!event) {
+      return res.status(404).json({ error: 'Igikorwa ntikibonetse (Event not found)' });
+    }
+
+    const existing = db.prepare('SELECT 1 FROM event_interested WHERE event_id = ? AND user_id = ?').get(eventId, userId);
+
+    let isNowInterested: boolean;
+    if (typeof interested === 'boolean') {
+      if (interested) {
+        db.prepare('INSERT OR IGNORE INTO event_interested (event_id, user_id) VALUES (?, ?)').run(eventId, userId);
+        isNowInterested = true;
+      } else {
+        db.prepare('DELETE FROM event_interested WHERE event_id = ? AND user_id = ?').run(eventId, userId);
+        isNowInterested = false;
+      }
+    } else {
+      // Toggle
+      if (existing) {
+        db.prepare('DELETE FROM event_interested WHERE event_id = ? AND user_id = ?').run(eventId, userId);
+        isNowInterested = false;
+      } else {
+        db.prepare('INSERT OR IGNORE INTO event_interested (event_id, user_id) VALUES (?, ?)').run(eventId, userId);
+        isNowInterested = true;
+      }
+    }
+
+    const countRow = db.prepare('SELECT COUNT(*) as count FROM event_interested WHERE event_id = ?').get(eventId) as any;
+    const newCount = Number(countRow?.count || 0);
+
+    // Real-time broadcast to all clients via SSE
+    broadcastRealtimeEvent('event:interest', {
+      event_id: eventId,
+      user_id: userId,
+      user_name: req.user!.name,
+      is_interested: isNowInterested,
+      interested_count: newCount,
+    });
+
+    logActivity(
+      userId,
+      req.user!.name,
+      req.user!.role,
+      isNowInterested ? 'EVENT_INTEREST_ADD' : 'EVENT_INTEREST_REMOVE',
+      'events',
+      eventId,
+      `${isNowInterested ? 'Kugaragaza ubushake bwo kwitabira' : 'Kuvana ubushake bwo kwitabira'} igikorwa "${event.title}"`
+    );
+
+    res.json({
+      success: true,
+      event_id: eventId,
+      is_interested: isNowInterested,
+      interested_count: newCount,
+      message: isNowInterested
+        ? 'Wiyandikishije kugaragaza ko wishimiye iki gikorwa!'
+        : 'Wavanyeho ukwifuza kwitabira iki gikorwa.',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to update interest' });
+  }
+});
+
+app.get('/api/documents', (req, res) => {
+  try {
+    const docs = db.prepare(`
+      SELECT d.*, s.title as song_title
+      FROM documents d
+      LEFT JOIN songs s ON d.song_id = s.id
+      WHERE (d.is_deleted = 0 OR d.is_deleted IS NULL) AND d.status = 'published'
+      ORDER BY d.created_at DESC
+    `).all();
+    res.json(docs);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch documents' });
+  }
+});
+
+app.get('/api/content-articles', (req, res) => {
+  try {
+    const { type } = req.query;
+    let query = `SELECT * FROM content_articles WHERE (is_deleted = 0 OR is_deleted IS NULL) AND status = 'published'`;
+    const params: any[] = [];
+    if (type && type !== 'all') {
+      query += ` AND type = ?`;
+      params.push(type);
+    }
+    query += ` ORDER BY published_at DESC, created_at DESC`;
+    const articles = db.prepare(query).all(...params);
+    res.json(articles);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch articles' });
+  }
+});
+
+// -------------------------------------------------------------
+// ADMIN MANAGEMENT ROUTES (requireAdmin / RBAC)
+// -------------------------------------------------------------
+app.get('/api/admin/metrics', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const totalUsers = db.prepare('SELECT COUNT(*) as count FROM users').get() as any;
+    const adminUsers = db.prepare("SELECT COUNT(*) as count FROM users WHERE role IN ('super_admin', 'admin', 'content_admin', 'moderator')").get() as any;
+    const disabledUsers = db.prepare('SELECT COUNT(*) as count FROM users WHERE is_disabled = 1').get() as any;
+
+    const totalSongs = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const publishedSongs = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND (status = 'published' OR status IS NULL)").get() as any;
+    const draftSongs = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND status = 'draft'").get() as any;
+    const releasedSongs = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND release_status = 'released'").get() as any;
+    const unreleasedSongs = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND release_status = 'unreleased'").get() as any;
+    const deletedSongs = db.prepare('SELECT COUNT(*) as count FROM songs WHERE is_deleted = 1').get() as any;
+
+    const totalAudio = db.prepare('SELECT COUNT(*) as count FROM audio_tracks WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const totalImages = db.prepare('SELECT COUNT(*) as count FROM images WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const totalComments = db.prepare('SELECT COUNT(*) as count FROM comments WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const pendingComments = db.prepare("SELECT COUNT(*) as count FROM comments WHERE (is_deleted = 0 OR is_deleted IS NULL) AND status = 'flagged'").get() as any;
+
+    const totalAnnouncements = db.prepare('SELECT COUNT(*) as count FROM announcements WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const totalEvents = db.prepare('SELECT COUNT(*) as count FROM events WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const totalDocuments = db.prepare('SELECT COUNT(*) as count FROM documents WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const totalArticles = db.prepare('SELECT COUNT(*) as count FROM content_articles WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+
+    const donationsTotal = db.prepare("SELECT COALESCE(SUM(amount), 0) as total, COUNT(*) as count FROM payment_transactions WHERE status = 'successful'").get() as any;
+    const pendingDonations = db.prepare("SELECT COUNT(*) as count FROM payment_transactions WHERE status = 'pending'").get() as any;
+
+    const recentActivity = db.prepare(`
+      SELECT * FROM activity_logs ORDER BY created_at DESC LIMIT 20
+    `).all();
+
+    res.json({
+      totalUsers: totalUsers?.count || 0,
+      adminUsers: adminUsers?.count || 0,
+      disabledUsers: disabledUsers?.count || 0,
+      totalSongs: totalSongs?.count || 0,
+      publishedSongs: publishedSongs?.count || 0,
+      draftSongs: draftSongs?.count || 0,
+      releasedSongs: releasedSongs?.count || 0,
+      unreleasedSongs: unreleasedSongs?.count || 0,
+      deletedSongs: deletedSongs?.count || 0,
+      totalAudio: totalAudio?.count || 0,
+      totalImages: totalImages?.count || 0,
+      totalComments: totalComments?.count || 0,
+      pendingComments: pendingComments?.count || 0,
+      totalAnnouncements: totalAnnouncements?.count || 0,
+      totalEvents: totalEvents?.count || 0,
+      totalDocuments: totalDocuments?.count || 0,
+      totalArticles: totalArticles?.count || 0,
+      successfulDonationsCount: donationsTotal?.count || 0,
+      totalDonationsAmount: donationsTotal?.total || 0,
+      pendingDonationsCount: pendingDonations?.count || 0,
+      recentActivity
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to load admin metrics' });
+  }
+});
+
+// Admin Global Search
+app.get('/api/admin/search', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const q = req.query.q ? String(req.query.q).trim() : '';
+    if (!q) {
+      return res.json({ songs: [], announcements: [], events: [], users: [] });
+    }
+    const term = `%${q}%`;
+
+    const songs = db.prepare(`
+      SELECT id, title, composer, release_status, status
+      FROM songs
+      WHERE (is_deleted = 0 OR is_deleted IS NULL)
+        AND (title LIKE ? OR composer LIKE ? OR song_number LIKE ?)
+      LIMIT 10
+    `).all(term, term, term);
+
+    const announcements = db.prepare(`
+      SELECT id, title, category, status
+      FROM announcements
+      WHERE (is_deleted = 0 OR is_deleted IS NULL)
+        AND (title LIKE ? OR content LIKE ?)
+      LIMIT 10
+    `).all(term, term);
+
+    const events = db.prepare(`
+      SELECT id, title, location, event_date, status
+      FROM events
+      WHERE (is_deleted = 0 OR is_deleted IS NULL)
+        AND (title LIKE ? OR location LIKE ?)
+      LIMIT 10
+    `).all(term, term);
+
+    const users = db.prepare(`
+      SELECT id, name, email, role, is_disabled
+      FROM users
+      WHERE name LIKE ? OR email LIKE ? OR phone LIKE ?
+      LIMIT 10
+    `).all(term, term, term);
+
+    res.json({ songs, announcements, events, users });
+  } catch (err) {
+    res.status(500).json({ error: 'Search failed' });
+  }
+});
+
+// -------------------------------------------------------------
+// ADMIN SONGS MANAGEMENT
+// -------------------------------------------------------------
+
+function resolveCategoryId(input?: string | null): string {
+  if (!input) return 'cat_agakiza';
+  const clean = input.trim().toLowerCase();
+  if (clean.includes('agakiza') || clean === '1' || clean === 'cat_agakiza') return 'cat_agakiza';
+  if (clean.includes('ijuru') || clean === '2' || clean === 'cat_ijuru') return 'cat_ijuru';
+  if (clean.includes('gushima') || clean === '3' || clean === 'cat_gushima') return 'cat_gushima';
+  if (clean.includes('kwizera') || clean === '4' || clean === 'cat_kwizera') return 'cat_kwizera';
+  return 'cat_agakiza';
+}
+
+function parseSongsFromDocumentText(text: string): Array<{
+  song_number: string;
+  title: string;
+  lyrics: string;
+  category: string;
+}> {
+  const normalized = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  const categoryHeaders = [
+    { cat: 'AGAKIZA', regex: /(?:^|\n)\s*(?:Category\s*\d*[\.:\-]?\s*)?AGAKIZA[^\n]*/gi },
+    { cat: 'IJURU', regex: /(?:^|\n)\s*(?:Category\s*\d*[\.:\-]?\s*)?IJURU[^\n]*/gi },
+    { cat: 'GUSHIMA', regex: /(?:^|\n)\s*(?:Category\s*\d*[\.:\-]?\s*)?GUSHIMA[^\n]*/gi },
+    { cat: 'KWIZERA', regex: /(?:^|\n)\s*(?:Category\s*\d*[\.:\-]?\s*)?KWIZERA[^\n]*/gi }
+  ];
+
+  const foundMarkers: Array<{ category: string; index: number; headerLength: number }> = [];
+  for (const c of categoryHeaders) {
+    let m: RegExpExecArray | null;
+    while ((m = c.regex.exec(normalized)) !== null) {
+      foundMarkers.push({
+        category: c.cat,
+        index: m.index,
+        headerLength: m[0].length
+      });
+    }
+  }
+
+  foundMarkers.sort((a, b) => a.index - b.index);
+
+  const songs: Array<{ song_number: string; title: string; lyrics: string; category: string }> = [];
+
+  const isLikelySongTitle = (raw: string): boolean => {
+    const lettersOnly = raw.replace(/[^a-zA-Z]/g, '');
+    if (lettersOnly.length < 2) return false;
+    const uppercaseLetters = raw.replace(/[^A-Z]/g, '');
+    const ratio = uppercaseLetters.length / lettersOnly.length;
+    return ratio >= 0.65;
+  };
+
+  const extractFromSection = (sectionText: string, category: string) => {
+    const songHeaderRegex = /(?:^|\n)\s*(\d+)[\.\)]\s*([^\n\r]+)/g;
+    const matches: Array<{ number: string; title: string; index: number; headerLength: number }> = [];
+    let m: RegExpExecArray | null;
+    while ((m = songHeaderRegex.exec(sectionText)) !== null) {
+      const rawTitle = m[2].trim();
+      if (isLikelySongTitle(rawTitle)) {
+        matches.push({
+          number: m[1],
+          title: rawTitle,
+          index: m.index,
+          headerLength: m[0].length
+        });
+      }
+    }
+
+    for (let i = 0; i < matches.length; i++) {
+      const cur = matches[i];
+      const nextStart = i < matches.length - 1 ? matches[i + 1].index : sectionText.length;
+      let lyrics = sectionText.substring(cur.index + cur.headerLength, nextStart).trim();
+      lyrics = lyrics.replace(/March 8, 2016\s*\[.*?Aimable HA/gi, '').trim();
+      songs.push({
+        song_number: cur.number,
+        title: cur.title,
+        lyrics,
+        category
+      });
+    }
+  };
+
+  if (foundMarkers.length > 0) {
+    for (let i = 0; i < foundMarkers.length; i++) {
+      const cur = foundMarkers[i];
+      const nextStart = i < foundMarkers.length - 1 ? foundMarkers[i + 1].index : normalized.length;
+      const sectionText = normalized.substring(cur.index + cur.headerLength, nextStart).trim();
+      extractFromSection(sectionText, cur.category);
+    }
+  } else {
+    extractFromSection(normalized, 'AGAKIZA');
+  }
+
+  return songs;
+}
+
+/**
+ * Standard RFC 4180 CSV parser supporting multiline fields inside quotes,
+ * escaped double quotes (""), and varied delimiters.
+ */
+function parseCSVRows(csvText: string): string[][] {
+  const rows: string[][] = [];
+  let currentRow: string[] = [];
+  let currentField = '';
+  let inQuotes = false;
+
+  const normalized = csvText.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+
+  for (let i = 0; i < normalized.length; i++) {
+    const char = normalized[i];
+    const nextChar = normalized[i + 1];
+
+    if (inQuotes) {
+      if (char === '"') {
+        if (nextChar === '"') {
+          currentField += '"';
+          i++; // Skip escaped quote
+        } else {
+          inQuotes = false;
+        }
+      } else {
+        currentField += char;
+      }
+    } else {
+      if (char === '"') {
+        inQuotes = true;
+      } else if (char === ',') {
+        currentRow.push(currentField);
+        currentField = '';
+      } else if (char === '\n') {
+        currentRow.push(currentField);
+        if (currentRow.some(col => col.trim().length > 0)) {
+          rows.push(currentRow);
+        }
+        currentRow = [];
+        currentField = '';
+      } else {
+        currentField += char;
+      }
+    }
+  }
+
+  if (currentField.length > 0 || currentRow.length > 0) {
+    currentRow.push(currentField);
+    if (currentRow.some(col => col.trim().length > 0)) {
+      rows.push(currentRow);
+    }
+  }
+
+  return rows;
+}
+
+function parseSongsFromCSVText(csvContent: string): Array<{
+  song_number: string;
+  title: string;
+  lyrics: string;
+  category: string;
+  composer?: string;
+  description?: string;
+  language?: string;
+  release_date?: string;
+  status?: string;
+  release_status?: string;
+  solfa_notation?: string;
+}> {
+  const rows = parseCSVRows(csvContent);
+  if (rows.length < 2) return [];
+
+  const rawHeaders = rows[0].map(h => h.trim().toLowerCase().replace(/[\s_#-]+/g, ''));
+  const findColIndex = (...candidates: string[]): number => {
+    return rawHeaders.findIndex(h => candidates.some(c => h.includes(c)));
+  };
+
+  const titleIdx = findColIndex('title', 'umutwe', 'name', 'izina');
+  const catIdx = findColIndex('category', 'icyiciro', 'cat');
+  const lyricsIdx = findColIndex('lyrics', 'amagambo', 'content', 'text');
+  const numberIdx = findColIndex('songnumber', 'number', 'nimero', 'num', 'no');
+  const composerIdx = findColIndex('composer', 'uwahimbye', 'author', 'artist');
+  const descIdx = findColIndex('description', 'ibisobanuro', 'desc', 'summary');
+  const langIdx = findColIndex('language', 'ururimi', 'lang');
+  const dateIdx = findColIndex('releasedate', 'date', 'itariki');
+  const statusIdx = findColIndex('status', 'imimerere');
+  const releaseStatusIdx = findColIndex('releasestatus', 'isomwa', 'itangazwa');
+  const solfaIdx = findColIndex('solfa', 'notation', 'amanota', 'notes');
+
+  const songs: Array<any> = [];
+
+  for (let r = 1; r < rows.length; r++) {
+    const row = rows[r];
+    const title = titleIdx !== -1 ? (row[titleIdx] || '').trim() : '';
+    if (!title) continue;
+
+    const category = catIdx !== -1 ? (row[catIdx] || '').trim() : 'AGAKIZA';
+    const lyrics = lyricsIdx !== -1 ? (row[lyricsIdx] || '').trim() : '';
+    const song_number = numberIdx !== -1 ? (row[numberIdx] || '').trim() : '';
+    const composer = composerIdx !== -1 ? (row[composerIdx] || '').trim() : 'La Lumiere Choir';
+    const description = descIdx !== -1 ? (row[descIdx] || '').trim() : '';
+    const language = langIdx !== -1 ? (row[langIdx] || '').trim() : 'Kinyarwanda';
+    const release_date = dateIdx !== -1 ? (row[dateIdx] || '').trim() : '';
+    const status = statusIdx !== -1 ? (row[statusIdx] || '').trim() : 'published';
+    const release_status = releaseStatusIdx !== -1 ? (row[releaseStatusIdx] || '').trim() : 'released';
+    const solfa_notation = solfaIdx !== -1 ? (row[solfaIdx] || '').trim() : '';
+
+    songs.push({
+      title,
+      category,
+      lyrics,
+      song_number,
+      composer: composer || 'La Lumiere Choir',
+      description,
+      language: language || 'Kinyarwanda',
+      release_date,
+      status: status === 'draft' ? 'draft' : 'published',
+      release_status: release_status === 'unreleased' ? 'unreleased' : 'released',
+      solfa_notation,
+    });
+  }
+
+  return songs;
+}
+
+// Downloadable CSV template for batch import
+app.get('/api/admin/songs/csv-template', (req, res) => {
+  const csvHeaders = 'Song_Number,Title,Category,Composer,Description,Language,Release_Date,Status,Release_Status,Lyrics,Solfa_Notation\r\n';
+  const sample1 = '1,"NGWINO TUJYANE","AGAKIZA","La Lumiere Choir","Indirimbo yo guhamagarira abantu agakiza n\'urukundo rw\'Imana","Kinyarwanda","2026-01-01","published","released","1. Ngwino tujyane iwacu aho Imana yateguriye abera...\n\nR/ Uwo yatubereye igitambo...","d : r : m | f : s : l"\r\n';
+  const sample2 = '2,"TURI ABAGENZI","IJURU","La Lumiere Choir","Indirimbo y\'urugendo rugana mu ijuru","Kinyarwanda","2026-01-01","published","released","1. Bakundwa turi abagenzi kandi turi abimukira...\n\nR/ Nkumbuye cyane kwibera i Siyoni...","m : s : d | r : f : l"\r\n';
+  const sample3 = '3,"TURAGUSHIMA MANA","GUSHIMA","La Lumiere Choir","Indirimbo yo gushima no guhimbaza Imana","Kinyarwanda","2026-01-01","published","released","1. Turagushima Mana turaguhimbaza mukunzi we...\n\nR/ Ntacyo twabona twakwitura mwami...","s : m : d | f : r : t"\r\n';
+  const sample4 = '4,"ABANYAMUGISHA","KWIZERA","La Lumiere Choir","Indirimbo yo kwizera umugisha w\'Imana","Kinyarwanda","2026-01-01","published","released","1. Baraki yashatse kuvuma aba islaheri...\n\nR/ Turi abanyamugisha twaratoranijwe...","d : m : s | l : s : m"\r\n';
+  const csvContent = '\uFEFF' + csvHeaders + sample1 + sample2 + sample3 + sample4;
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename="indirimbo_batch_template.csv"');
+  res.send(csvContent);
+});
+
+// Stats for Admin Song Management Dashboard (Requirement 15)
+app.get('/api/admin/songs/stats', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const totalSongs = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    const publishedSongs = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND (status = 'published' OR status IS NULL)").get() as any;
+    const unpublishedSongs = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND status = 'draft'").get() as any;
+    const deletedSongs = db.prepare('SELECT COUNT(*) as count FROM songs WHERE is_deleted = 1').get() as any;
+
+    const catAgakiza = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND category_id = 'cat_agakiza'").get() as any;
+    const catIjuru = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND category_id = 'cat_ijuru'").get() as any;
+    const catGushima = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND category_id = 'cat_gushima'").get() as any;
+    const catKwizera = db.prepare("SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL) AND category_id = 'cat_kwizera'").get() as any;
+
+    res.json({
+      totalSongs: totalSongs?.count || 0,
+      publishedSongs: publishedSongs?.count || 0,
+      unpublishedSongs: unpublishedSongs?.count || 0,
+      deletedSongs: deletedSongs?.count || 0,
+      songsInAgakiza: catAgakiza?.count || 0,
+      songsInIjuru: catIjuru?.count || 0,
+      songsInGushima: catGushima?.count || 0,
+      songsInKwizera: catKwizera?.count || 0
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch song stats' });
+  }
+});
+
+// Official document songs sync report
+app.get('/api/admin/songs/official-import-report', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const report = syncOfficialDocumentSongs(db);
+    res.json(report);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to generate official import report' });
+  }
+});
+
+// Trigger official document songs re-sync
+app.post('/api/admin/songs/sync-official', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const report = syncOfficialDocumentSongs(db);
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'SYNC_OFFICIAL_SONGS', 'songs', 'all', `Synchronized ${report.totalDetected} official document choir songs`);
+    broadcastRealtimeEvent('SONG_SYNC', { type: 'OFFICIAL_SONGS_SYNCED', count: report.totalDetected });
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to sync official songs' });
+  }
+});
+
+// -------------------------------------------------------------
+// Secure Document Parsing & Upsert Utility Endpoints
+// -------------------------------------------------------------
+
+// 1. Parse text document or uploaded file into JSON format with schema: { title, category, lyrics }
+app.post('/api/admin/songs/parse-document', requireAdmin, upload.single('file'), async (req: AuthRequest, res) => {
+  try {
+    let documentText = '';
+    if (req.file) {
+      const ext = path.extname(req.file.originalname).toLowerCase();
+      if (ext === '.docx') {
+        const result = await mammoth.extractRawText({ path: req.file.path });
+        documentText = result.value || '';
+      } else {
+        documentText = fs.readFileSync(req.file.path, 'utf8');
+      }
+      try { fs.unlinkSync(req.file.path); } catch (e) {}
+    } else if (req.body.text && typeof req.body.text === 'string') {
+      documentText = req.body.text;
+    } else {
+      return res.status(400).json({ error: 'Nta nyandiko yatanzwe (No document text or file provided)' });
+    }
+
+    if (!documentText.trim()) {
+      return res.status(400).json({ error: 'Inyandiko irarangiye nta magambo arimo (Document text is empty)' });
+    }
+
+    const songs = parseSongDocumentToJSON(documentText);
+    res.json({
+      success: true,
+      count: songs.length,
+      songs
+    });
+  } catch (err: any) {
+    console.error('Error parsing song document to JSON:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu gusesengura inyandiko' });
+  }
+});
+
+// 2. Upsert parsed songs into database with duplicate title check
+app.post('/api/admin/songs/upsert-parsed', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { songs } = req.body;
+    if (!Array.isArray(songs) || songs.length === 0) {
+      return res.status(400).json({ error: 'Nta ndirimbo zatanzwe (No songs array provided in body)' });
+    }
+
+    const report = upsertSongRecords(songs, db);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'UPSERT_SONGS',
+      'songs',
+      'batch',
+      `Upserted ${report.totalProcessed} songs (inserted: ${report.insertedCount}, updated: ${report.updatedCount})`
+    );
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'batch_upsert',
+      insertedCount: report.insertedCount,
+      updatedCount: report.updatedCount
+    });
+
+    res.json({
+      success: true,
+      report
+    });
+  } catch (err: any) {
+    console.error('Error upserting songs:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu kubika indirimbo' });
+  }
+});
+
+// 3. End-to-end: Parse text document into JSON and upsert in one secure step
+app.post('/api/admin/songs/parse-and-upsert', requireAdmin, upload.single('file'), async (req: AuthRequest, res) => {
+  try {
+    let documentText = '';
+    if (req.file) {
+      const ext = path.extname(req.file.originalname).toLowerCase();
+      if (ext === '.docx') {
+        const result = await mammoth.extractRawText({ path: req.file.path });
+        documentText = result.value || '';
+      } else {
+        documentText = fs.readFileSync(req.file.path, 'utf8');
+      }
+      try { fs.unlinkSync(req.file.path); } catch (e) {}
+    } else if (req.body.text && typeof req.body.text === 'string') {
+      documentText = req.body.text;
+    } else {
+      return res.status(400).json({ error: 'Nta nyandiko yatanzwe (No document text or file provided)' });
+    }
+
+    const summary = parseAndUpsertSongDocument(documentText, db);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'IMPORT_SONG_DOCUMENT',
+      'songs',
+      'batch',
+      `Imported and upserted ${summary.parsedCount} songs (inserted: ${summary.insertedCount}, updated: ${summary.updatedCount})`
+    );
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'document_import',
+      parsedCount: summary.parsedCount,
+      insertedCount: summary.insertedCount,
+      updatedCount: summary.updatedCount
+    });
+
+    res.json({
+      success: true,
+      summary
+    });
+  } catch (err: any) {
+    console.error('Error in parse-and-upsert:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu gusesengura no kubika indirimbo' });
+  }
+});
+
+// 4. Service endpoint to manage a song record (upsert based on title unique identifier)
+const handleManageSongRecord = (req: AuthRequest, res: any) => {
+  try {
+    // Accepts single song object: { song: {...} } or req.body directly
+    // Or accepts an array of parsed song objects: { songs: [...] } or array directly
+    if (Array.isArray(req.body) || (req.body && Array.isArray(req.body.songs))) {
+      const songsList = Array.isArray(req.body) ? req.body : req.body.songs;
+      if (songsList.length === 0) {
+        return res.status(400).json({ error: 'Nta ndirimbo zatanzwe (No songs provided in array)' });
+      }
+      const report = upsertSongRecords(songsList, db);
+      if (req.user) {
+        logActivity(
+          req.user.id,
+          req.user.name,
+          req.user.role,
+          'UPSERT_SONGS',
+          'songs',
+          'batch',
+          `Upserted ${report.totalProcessed} parsed songs (inserted: ${report.insertedCount}, updated: ${report.updatedCount}) via unique title check`
+        );
+      }
+      broadcastRealtimeEvent('songs_updated', {
+        action: 'batch_upsert',
+        insertedCount: report.insertedCount,
+        updatedCount: report.updatedCount
+      });
+      return res.json({
+        success: true,
+        report
+      });
+    }
+
+    const songInput = req.body.song || req.body;
+    if (!songInput || typeof songInput !== 'object' || !songInput.title) {
+      return res.status(400).json({ error: 'Nta ndirimbo cyangwa umutwe watanzwe (Song object with title is required)' });
+    }
+
+    const result = manageSong(songInput, db);
+
+    if (req.user) {
+      logActivity(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        result.action === 'inserted' ? 'CREATE_SONG' : 'UPDATE_SONG',
+        'songs',
+        result.song_id,
+        `${result.action === 'inserted' ? 'Inserted new' : 'Updated existing'} song "${result.title}" (ID: ${result.song_id}) via unique title check`
+      );
+    }
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: result.action,
+      song_id: result.song_id,
+      title: result.title
+    });
+
+    res.json({
+      success: true,
+      result
+    });
+  } catch (err: any) {
+    console.error('Error in manage-record service:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu gucunga indirimbo' });
+  }
+};
+
+app.post('/api/admin/songs/manage-record', requireAdmin, handleManageSongRecord);
+app.post('/api/admin/songs/upsert-record', requireAdmin, handleManageSongRecord);
+app.post('/api/admin/songs/upsert', requireAdmin, handleManageSongRecord);
+app.post('/api/songs/manage-record', optionalAuth, handleManageSongRecord);
+app.post('/api/songs/upsert-record', optionalAuth, handleManageSongRecord);
+app.post('/api/songs/upsert', optionalAuth, handleManageSongRecord);
+
+// Import songs from CSV, Word (.docx), text file, or JSON array
+app.post('/api/admin/songs/import', requireAdmin, upload.single('file'), async (req: AuthRequest, res) => {
+  try {
+    let rawText = '';
+    let parsedSongList: Array<{
+      song_number: string;
+      title: string;
+      lyrics: string;
+      category: string;
+      composer?: string;
+      description?: string;
+      language?: string;
+      release_date?: string;
+      status?: string;
+      release_status?: string;
+      solfa_notation?: string;
+    }> = [];
+
+    if (req.file) {
+      const ext = path.extname(req.file.originalname).toLowerCase();
+      if (ext === '.docx') {
+        const result = await mammoth.extractRawText({ path: req.file.path });
+        rawText = result.value || '';
+      } else if (ext === '.csv') {
+        const fileContent = fs.readFileSync(req.file.path, 'utf8');
+        parsedSongList = parseSongsFromCSVText(fileContent);
+      } else if (ext === '.json') {
+        const fileContent = fs.readFileSync(req.file.path, 'utf8');
+        try {
+          const jsonSongs = JSON.parse(fileContent);
+          if (Array.isArray(jsonSongs)) {
+            parsedSongList = jsonSongs.map((s: any) => ({
+              song_number: String(s.song_number || s.number || ''),
+              title: s.title || '',
+              lyrics: s.lyrics || s.content || '',
+              category: s.category || s.category_name || s.category_id || 'AGAKIZA',
+              composer: s.composer || 'La Lumiere Choir',
+              description: s.description || '',
+              language: s.language || 'Kinyarwanda',
+              release_date: s.release_date || '',
+              status: s.status || 'published',
+              release_status: s.release_status || 'released',
+              solfa_notation: s.solfa_notation || ''
+            }));
+          }
+        } catch (e) {
+          rawText = fileContent;
+        }
+      } else {
+        rawText = fs.readFileSync(req.file.path, 'utf8');
+        if (rawText.includes(',') && (rawText.toLowerCase().includes('title') || rawText.toLowerCase().includes('lyrics'))) {
+          parsedSongList = parseSongsFromCSVText(rawText);
+        }
+      }
+
+      // Cleanup uploaded temp file
+      try {
+        fs.unlinkSync(req.file.path);
+      } catch (e) {}
+    } else if (req.body.csv && typeof req.body.csv === 'string') {
+      parsedSongList = parseSongsFromCSVText(req.body.csv);
+    } else if (req.body.text && typeof req.body.text === 'string') {
+      rawText = req.body.text;
+      if (rawText.includes(',') && (rawText.toLowerCase().includes('title') || rawText.toLowerCase().includes('lyrics'))) {
+        parsedSongList = parseSongsFromCSVText(rawText);
+      }
+    } else if (Array.isArray(req.body.songs)) {
+      parsedSongList = req.body.songs;
+    } else {
+      return res.status(400).json({ error: 'Nta dosiye cyangwa inyandiko yoherejwe (No file or text provided)' });
+    }
+
+    // Parse raw text into structured songs if needed
+    if (rawText && parsedSongList.length === 0) {
+      parsedSongList = parseSongsFromDocumentText(rawText);
+    }
+
+    if (parsedSongList.length === 0) {
+      return res.status(400).json({
+        error: 'Nta ndirimbo zabonetse mu nyandiko (No songs found). Suzuma niba harimo ibyiciro 4 (AGAKIZA, IJURU, GUSHIMA, KWIZERA) n\'indirimbo zanditse nka: 1. UMUTWE cyangwa dosiye ya CSV ikurikije template.'
+      });
+    }
+
+    const existingSongs = db.prepare(`
+      SELECT s.id, LOWER(TRIM(s.title)) as norm_title, s.song_number, s.category_id
+      FROM songs s
+      WHERE (s.is_deleted = 0 OR s.is_deleted IS NULL)
+    `).all() as any[];
+
+    const importedSongs: any[] = [];
+    const skippedSongs: any[] = [];
+
+    for (const item of parsedSongList) {
+      const cleanTitle = (item.title || '').trim();
+      if (!cleanTitle) continue;
+
+      const normTitle = cleanTitle.toLowerCase();
+      const songNumber = (item.song_number || '').trim();
+      const catId = resolveCategoryId(item.category);
+      const cleanLyrics = (item.lyrics || '').trim();
+
+      // Duplicate check: title and category match
+      const isDuplicate = existingSongs.some(es => {
+        return es.norm_title === normTitle && (es.category_id === catId || !es.category_id);
+      });
+
+      if (isDuplicate) {
+        skippedSongs.push({
+          title: cleanTitle,
+          song_number: songNumber,
+          category: catId,
+          reason: 'Duplicate: indirimbo isanzwe mu gitabo'
+        });
+        continue;
+      }
+
+      const newSongId = 'song_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7);
+      const parsedNum = parseInt(songNumber, 10);
+      const displayOrder = !isNaN(parsedNum) ? parsedNum : (existingSongs.length + importedSongs.length + 1);
+
+      db.prepare(`
+        INSERT INTO songs (
+          id, title, song_number, composer, category_id, release_status,
+          release_date, description, cover_image_url, access_password_hash,
+          status, is_deleted, created_by, display_order
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', NULL, ?, 0, ?, ?)
+      `).run(
+        newSongId,
+        cleanTitle,
+        songNumber || null,
+        item.composer || 'La Lumiere Choir',
+        catId,
+        item.release_status === 'unreleased' ? 'unreleased' : 'released',
+        item.release_date || new Date().toISOString().split('T')[0],
+        item.description || '',
+        item.status === 'draft' ? 'draft' : 'published',
+        req.user!.id,
+        displayOrder
+      );
+
+      // Insert lyrics and optional solfa notation
+      if (cleanLyrics || item.solfa_notation) {
+        db.prepare(`
+          INSERT INTO lyrics (id, song_id, content, solfa_notation, language)
+          VALUES (?, ?, ?, ?, ?)
+        `).run(
+          'lyr_' + Date.now() + '_' + Math.random().toString(36).substring(2, 7),
+          newSongId,
+          cleanLyrics || '',
+          item.solfa_notation || null,
+          item.language || 'rw'
+        );
+      }
+
+      importedSongs.push({
+        id: newSongId,
+        title: cleanTitle,
+        song_number: songNumber,
+        category_id: catId,
+        status: item.status === 'draft' ? 'draft' : 'published'
+      });
+
+      existingSongs.push({
+        id: newSongId,
+        norm_title: normTitle,
+        song_number: songNumber,
+        category_id: catId
+      });
+    }
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'IMPORT_SONGS',
+      'songs',
+      'batch_import',
+      `Imported ${importedSongs.length} songs, skipped ${skippedSongs.length} duplicates`
+    );
+
+    const totalCountRow = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+
+    // Real-time broadcast to all connected devices/tabs
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'batch_import',
+      importedCount: importedSongs.length,
+      skippedCount: skippedSongs.length,
+      totalSongs: totalCountRow?.count || 0
+    });
+
+    res.json({
+      success: true,
+      message: `Hashyizwemo indirimbo nshya ${importedSongs.length}. Hasimbutswe ${skippedSongs.length} zisanzwemo.`,
+      importedCount: importedSongs.length,
+      skippedCount: skippedSongs.length,
+      importedSongs,
+      skippedSongs,
+      totalSongsInDb: totalCountRow?.count || 0
+    });
+  } catch (err: any) {
+    console.error('Song import error:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu kwinjiza indirimbo (Failed to import songs)' });
+  }
+});
+
+app.get('/api/admin/songs', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { search, category, status, release_status, include_deleted } = req.query;
+    let query = `
+      SELECT s.id, s.title, s.song_number, s.composer, s.category_id, s.release_status,
+             s.release_date, s.description, s.cover_image_url, s.views_count,
+             s.status, s.is_deleted, s.deleted_at, s.created_at, s.updated_at,
+             sc.name as category_name,
+             (SELECT COUNT(*) FROM audio_tracks at WHERE at.song_id = s.id AND (at.is_deleted = 0 OR at.is_deleted IS NULL)) as audio_count,
+             (SELECT COUNT(*) FROM comments c WHERE c.song_id = s.id AND (c.is_deleted = 0 OR c.is_deleted IS NULL)) as comments_count,
+             (SELECT content FROM lyrics l WHERE l.song_id = s.id LIMIT 1) as lyrics,
+             (SELECT solfa_notation FROM lyrics l WHERE l.song_id = s.id LIMIT 1) as solfa_notation
+      FROM songs s
+      LEFT JOIN song_categories sc ON s.category_id = sc.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (include_deleted === 'true') {
+      // show all including deleted
+    } else {
+      query += ` AND (s.is_deleted = 0 OR s.is_deleted IS NULL)`;
+    }
+
+    if (category && category !== 'all') {
+      query += ` AND (s.category_id = ? OR sc.slug = ?)`;
+      params.push(category, category);
+    }
+
+    if (status && status !== 'all') {
+      query += ` AND s.status = ?`;
+      params.push(status);
+    }
+
+    if (release_status && release_status !== 'all') {
+      query += ` AND s.release_status = ?`;
+      params.push(release_status);
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (
+        s.title LIKE ? OR
+        s.composer LIKE ? OR
+        s.song_number LIKE ? OR
+        EXISTS (SELECT 1 FROM lyrics l WHERE l.song_id = s.id AND l.content LIKE ?)
+      )`;
+      params.push(term, term, term, term);
+    }
+
+    query += ` ORDER BY s.created_at DESC`;
+    const songs = db.prepare(query).all(...params);
+    res.json(songs);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch admin songs' });
+  }
+});
+
+app.post(['/api/admin/songs', '/api/songs'], requireAdmin, uploadFlexible, (req: AuthRequest, res) => {
+  try {
+    const {
+      title,
+      song_number,
+      composer,
+      category_id,
+      release_status,
+      release_date,
+      description,
+      cover_image_url,
+      access_password,
+      status,
+      lyrics,
+      solfa_notation,
+      language,
+      audio_tracks
+    } = req.body;
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: 'Umutwe w\'indirimbo urakenewe (Song title required)' });
+    }
+
+    // Direct image upload support via multipart/form-data
+    let finalCoverUrl = cover_image_url ? String(cover_image_url).trim() : '';
+    if (req.file) {
+      const check = isFileSafeImage(req.file);
+      if (!check.valid) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: check.reason || 'Ubwoko bw\'ifoto ntibwemewe.' });
+      }
+      finalCoverUrl = `/uploads/${req.file.filename}`;
+      try {
+        db.prepare(`
+          INSERT INTO images (id, title, category, file_url, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+          VALUES (?, ?, 'song_cover', ?, ?, ?, ?, ?, 0)
+        `).run(
+          'img_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+          title.trim(),
+          finalCoverUrl,
+          req.file.size,
+          req.file.mimetype || 'image/jpeg',
+          req.file.originalname,
+          req.user?.id || 'admin'
+        );
+      } catch (imgErr) {
+        console.warn('Notice recording song cover image:', imgErr);
+      }
+    }
+
+    const songId = 'song_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+    const pwdHash = access_password && access_password.trim() ? bcrypt.hashSync(access_password.trim(), 10) : null;
+    const finalStatus = status === 'draft' ? 'draft' : 'published';
+    const finalReleaseStatus = release_status === 'unreleased' ? 'unreleased' : 'released';
+    const finalCategoryId = resolveCategoryId(category_id);
+
+    const parsedNum = parseInt(song_number, 10);
+    const nextOrderRow = db.prepare('SELECT COALESCE(MAX(display_order), 0) + 1 as next_order FROM songs WHERE category_id = ?').get(finalCategoryId) as any;
+    const displayOrder = !isNaN(parsedNum) ? parsedNum : (nextOrderRow?.next_order || 1);
+
+    db.prepare(`
+      INSERT INTO songs (
+        id, title, song_number, composer, category_id, release_status,
+        release_date, description, cover_image_url, access_password_hash,
+        status, is_deleted, created_by, display_order
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)
+    `).run(
+      songId,
+      title.trim(),
+      song_number ? String(song_number).trim() : null,
+      composer?.trim() || 'La Lumiere Choir',
+      finalCategoryId,
+      finalReleaseStatus,
+      release_date || new Date().toISOString().split('T')[0],
+      description?.trim() || '',
+      finalCoverUrl,
+      pwdHash,
+      finalStatus,
+      req.user!.id,
+      displayOrder
+    );
+
+    // Add lyrics & solfa
+    if ((lyrics && lyrics.trim()) || (solfa_notation && solfa_notation.trim())) {
+      db.prepare(`
+        INSERT INTO lyrics (id, song_id, content, solfa_notation, language)
+        VALUES (?, ?, ?, ?, ?)
+      `).run('lyr_' + Date.now(), songId, lyrics?.trim() || '', solfa_notation?.trim() || null, language || 'rw');
+    }
+
+    // Add audio tracks if provided
+    if (Array.isArray(audio_tracks)) {
+      const insertTrk = db.prepare(`
+        INSERT INTO audio_tracks (id, song_id, title, track_type, audio_url, duration_seconds, is_deleted, created_by)
+        VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+      `);
+      audio_tracks.forEach(trk => {
+        if (trk.title && trk.audio_url) {
+          insertTrk.run(
+            'trk_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+            songId,
+            trk.title.trim(),
+            trk.track_type || 'full_song',
+            trk.audio_url,
+            trk.duration_seconds || 0,
+            req.user!.id
+          );
+        }
+      });
+    }
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'CREATE_SONG', 'songs', songId, `Added song "${title.trim()}" (${finalStatus}, ${finalReleaseStatus})`);
+
+    const totalCount = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'create',
+      songId,
+      totalSongs: totalCount?.count || 0
+    });
+
+    res.status(201).json({ message: 'Indirimbo yongewemo neza (Song created successfully)', songId });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create song' });
+  }
+});
+
+app.put(['/api/admin/songs/:id', '/api/songs/:id'], requireAdmin, uploadFlexible, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      title,
+      song_number,
+      composer,
+      category_id,
+      release_status,
+      release_date,
+      description,
+      cover_image_url,
+      access_password,
+      status,
+      lyrics,
+      solfa_notation,
+      language
+    } = req.body;
+
+    const previousSong = db.prepare('SELECT * FROM songs WHERE id = ?').get(id) as any;
+    const previousLyrics = db.prepare('SELECT * FROM lyrics WHERE song_id = ?').get(id) as any;
+
+    if (!previousSong) {
+      return res.status(404).json({ error: 'Indirimbo ntabwo yabonetse (Song not found)' });
+    }
+
+    // Direct image upload support via multipart/form-data
+    let finalCoverUrl = cover_image_url !== undefined
+      ? (cover_image_url ? String(cover_image_url).trim() : '')
+      : (previousSong.cover_image_url || '');
+
+    if (req.file) {
+      const check = isFileSafeImage(req.file);
+      if (!check.valid) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: check.reason || 'Ubwoko bw\'ifoto ntibwemewe.' });
+      }
+      finalCoverUrl = `/uploads/${req.file.filename}`;
+      try {
+        db.prepare(`
+          INSERT INTO images (id, title, category, file_url, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+          VALUES (?, ?, 'song_cover', ?, ?, ?, ?, ?, 0)
+        `).run(
+          'img_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+          (title || req.file.originalname).trim(),
+          finalCoverUrl,
+          req.file.size,
+          req.file.mimetype || 'image/jpeg',
+          req.file.originalname,
+          req.user?.id || 'admin'
+        );
+      } catch (imgErr) {
+        console.warn('Notice recording song cover image:', imgErr);
+      }
+    }
+
+    const finalCategoryId = category_id !== undefined ? resolveCategoryId(category_id) : undefined;
+    const parsedNum = parseInt(song_number, 10);
+    const orderNum = !isNaN(parsedNum) ? parsedNum : 0;
+
+    let pwdUpdateClause = '';
+    const params: any[] = [
+      title?.trim(),
+      song_number ? String(song_number).trim() : null,
+      composer?.trim() || 'La Lumiere Choir',
+      finalCategoryId || null,
+      release_status || 'released',
+      release_date || null,
+      description || '',
+      finalCoverUrl,
+      status || 'published',
+      orderNum,
+      orderNum
+    ];
+
+    if (access_password !== undefined) {
+      if (access_password && access_password.trim()) {
+        const hash = bcrypt.hashSync(access_password.trim(), 10);
+        pwdUpdateClause = ', access_password_hash = ?';
+        params.push(hash);
+      } else if (release_status === 'released') {
+        pwdUpdateClause = ', access_password_hash = NULL';
+      }
+    }
+
+    params.push(id);
+
+    db.prepare(`
+      UPDATE songs
+      SET title = ?, song_number = ?, composer = ?, category_id = ?, release_status = ?,
+          release_date = ?, description = ?, cover_image_url = ?, status = ?,
+          display_order = CASE WHEN ? > 0 THEN ? ELSE display_order END,
+          updated_at = CURRENT_TIMESTAMP ${pwdUpdateClause}
+      WHERE id = ?
+    `).run(...params);
+
+    // Update lyrics
+    if (lyrics !== undefined || solfa_notation !== undefined) {
+      const existingLyrics = db.prepare('SELECT id FROM lyrics WHERE song_id = ?').get(id);
+      if (existingLyrics) {
+        db.prepare(`
+          UPDATE lyrics
+          SET content = COALESCE(?, content),
+              solfa_notation = COALESCE(?, solfa_notation),
+              language = COALESCE(?, language),
+              updated_at = CURRENT_TIMESTAMP
+          WHERE song_id = ?
+        `).run(lyrics, solfa_notation, language, id);
+      } else {
+        db.prepare(`
+          INSERT INTO lyrics (id, song_id, content, solfa_notation, language)
+          VALUES (?, ?, ?, ?, ?)
+        `).run('lyr_' + Date.now(), id, lyrics || '', solfa_notation || null, language || 'rw');
+      }
+    }
+
+    // Detailed field comparison for immutable audit trail
+    const changedFields: string[] = [];
+    const previousValues: Record<string, any> = {};
+    const newValues: Record<string, any> = {};
+
+    if (title !== undefined && title.trim() !== (previousSong.title || '')) {
+      changedFields.push('title');
+      previousValues.title = previousSong.title;
+      newValues.title = title.trim();
+    }
+    if (song_number !== undefined && String(song_number).trim() !== String(previousSong.song_number || '')) {
+      changedFields.push('song_number');
+      previousValues.song_number = previousSong.song_number;
+      newValues.song_number = String(song_number).trim();
+    }
+    if (composer !== undefined && composer.trim() !== (previousSong.composer || '')) {
+      changedFields.push('composer');
+      previousValues.composer = previousSong.composer;
+      newValues.composer = composer.trim();
+    }
+    if (finalCategoryId !== undefined && finalCategoryId !== previousSong.category_id) {
+      changedFields.push('category');
+      previousValues.category_id = previousSong.category_id;
+      newValues.category_id = finalCategoryId;
+    }
+    if (release_status !== undefined && release_status !== previousSong.release_status) {
+      changedFields.push('release_status');
+      previousValues.release_status = previousSong.release_status;
+      newValues.release_status = release_status;
+    }
+    if (status !== undefined && status !== previousSong.status) {
+      changedFields.push('status');
+      previousValues.status = previousSong.status;
+      newValues.status = status;
+    }
+    if (lyrics !== undefined && (!previousLyrics || lyrics.trim() !== (previousLyrics.content || ''))) {
+      changedFields.push('lyrics');
+      previousValues.lyricsLength = previousLyrics ? (previousLyrics.content || '').length : 0;
+      newValues.lyricsLength = lyrics.trim().length;
+    }
+    if (solfa_notation !== undefined && (!previousLyrics || solfa_notation !== (previousLyrics.solfa_notation || ''))) {
+      changedFields.push('solfa_notation');
+      previousValues.solfa_notation = previousLyrics ? previousLyrics.solfa_notation : null;
+      newValues.solfa_notation = solfa_notation;
+    }
+
+    const effectiveTitle = title ? title.trim() : (previousSong.title || id);
+    const summaryText = changedFields.length > 0
+      ? `Manual song edit on "${effectiveTitle}" (Changed: ${changedFields.join(', ')})`
+      : `Manual metadata update on "${effectiveTitle}"`;
+
+    const auditPayload = JSON.stringify({
+      actionType: 'MANUAL_SONG_EDIT',
+      songId: id,
+      songTitle: effectiveTitle,
+      songNumber: song_number ? String(song_number).trim() : previousSong.song_number,
+      changedFields,
+      previousValues,
+      newValues,
+      editor: {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role
+      },
+      summary: summaryText
+    });
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'MANUAL_SONG_EDIT',
+      'songs',
+      id,
+      auditPayload
+    );
+
+    const totalCount = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'update',
+      songId: id,
+      totalSongs: totalCount?.count || 0
+    });
+
+    res.json({ message: 'Indirimbo yavuguruwe neza (Song updated successfully)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update song' });
+  }
+});
+
+// Soft Delete Song
+app.delete(['/api/admin/songs/:id', '/api/songs/:id'], requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const song = db.prepare('SELECT title, song_number FROM songs WHERE id = ?').get(id) as any;
+    const songTitle = song?.title || id;
+
+    db.prepare('UPDATE songs SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
+
+    const deleteAudit = JSON.stringify({
+      actionType: 'DELETE_SONG',
+      songId: id,
+      songTitle,
+      songNumber: song?.song_number,
+      editor: { id: req.user!.id, name: req.user!.name, role: req.user!.role },
+      summary: `Soft-deleted song #${song?.song_number || ''} "${songTitle}"`
+    });
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_SONG', 'songs', id, deleteAudit);
+
+    const totalCount = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'delete',
+      songId: id,
+      totalSongs: totalCount?.count || 0
+    });
+
+    res.json({ message: 'Indirimbo yasibwe neza (Song deleted successfully)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to delete song' });
+  }
+});
+
+// Restore soft-deleted song
+app.post('/api/admin/songs/:id/restore', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const song = db.prepare('SELECT title, song_number FROM songs WHERE id = ?').get(id) as any;
+    const songTitle = song?.title || id;
+
+    db.prepare('UPDATE songs SET is_deleted = 0, deleted_at = NULL WHERE id = ?').run(id);
+
+    const restoreAudit = JSON.stringify({
+      actionType: 'RESTORE_SONG',
+      songId: id,
+      songTitle,
+      songNumber: song?.song_number,
+      editor: { id: req.user!.id, name: req.user!.name, role: req.user!.role },
+      summary: `Restored deleted song #${song?.song_number || ''} "${songTitle}"`
+    });
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'RESTORE_SONG', 'songs', id, restoreAudit);
+
+    const totalCount = db.prepare('SELECT COUNT(*) as count FROM songs WHERE (is_deleted = 0 OR is_deleted IS NULL)').get() as any;
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'restore',
+      songId: id,
+      totalSongs: totalCount?.count || 0
+    });
+
+    res.json({ message: 'Indirimbo yagaruwe neza (Song restored successfully)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to restore song' });
+  }
+});
+
+// Quick toggle published / draft status
+app.patch('/api/admin/songs/:id/status', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body; // 'published' | 'draft'
+    if (!['published', 'draft'].includes(status)) {
+      return res.status(400).json({ error: 'Imimerere itemewe (Invalid status)' });
+    }
+
+    db.prepare('UPDATE songs SET status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(status, id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'STATUS_CHANGE', 'songs', id, `Changed song status to ${status}`);
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'status_change',
+      songId: id,
+      status
+    });
+
+    res.json({ message: `Imimerere y\'indirimbo yahinduwe kuri ${status}`, status });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update song status' });
+  }
+});
+
+// Quick toggle release status (released / unreleased)
+app.patch('/api/admin/songs/:id/release-status', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { release_status, access_password } = req.body; // 'released' | 'unreleased'
+
+    if (!['released', 'unreleased'].includes(release_status)) {
+      return res.status(400).json({ error: 'Release status itemewe' });
+    }
+
+    let pwdClause = '';
+    const params: any[] = [release_status];
+
+    if (release_status === 'released') {
+      pwdClause = ', access_password_hash = NULL';
+    } else if (access_password && access_password.trim()) {
+      pwdClause = ', access_password_hash = ?';
+      params.push(bcrypt.hashSync(access_password.trim(), 10));
+    }
+
+    params.push(id);
+
+    db.prepare(`UPDATE songs SET release_status = ?, updated_at = CURRENT_TIMESTAMP ${pwdClause} WHERE id = ?`).run(...params);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'RELEASE_STATUS_CHANGE', 'songs', id, `Changed release status to ${release_status}`);
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'release_status_change',
+      songId: id,
+      release_status
+    });
+
+    res.json({ message: `Indirimbo yabaye ${release_status}`, release_status });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update release status' });
+  }
+});
+
+// -------------------------------------------------------------
+// AUDIO UPLOAD & MANAGEMENT
+// -------------------------------------------------------------
+app.get('/api/admin/audio-tracks', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { song_id, search } = req.query;
+    let query = `
+      SELECT at.*, s.title as song_title, s.release_status as song_release_status
+      FROM audio_tracks at
+      LEFT JOIN songs s ON at.song_id = s.id
+      WHERE (at.is_deleted = 0 OR at.is_deleted IS NULL)
+    `;
+    const params: any[] = [];
+    if (song_id) {
+      query += ` AND at.song_id = ?`;
+      params.push(song_id);
+    }
+    if (search && typeof search === 'string') {
+      query += ` AND (at.title LIKE ? OR s.title LIKE ?)`;
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    query += ` ORDER BY at.created_at DESC`;
+
+    const tracks = db.prepare(query).all(...params);
+    res.json(tracks);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch audio tracks' });
+  }
+});
+
+// Dedicated audio upload endpoint with format and size validation
+app.post('/api/admin/upload/audio', requireAdmin, upload.single('file'), (req: AuthRequest, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Nta dosiye y\'ijwi yatoranyijwe (No audio file uploaded)' });
+    }
+
+    const allowedMime = ['audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/x-wav', 'audio/mp4', 'audio/x-m4a', 'audio/m4a', 'audio/aac', 'audio/ogg'];
+    const ext = path.extname(req.file.originalname).toLowerCase();
+    const allowedExts = ['.mp3', '.wav', '.m4a', '.aac', '.ogg'];
+
+    if (!allowedMime.includes(req.file.mimetype) && !allowedExts.includes(ext)) {
+      fs.unlinkSync(req.file.path);
+      return res.status(400).json({ error: 'Ubwoko bw\'idosiye ntibwemewe. Koresha MP3, WAV, M4A, AAC, cyangwa OGG gusa.' });
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+    const { song_id, title, track_type, duration_seconds } = req.body;
+
+    let trackId = 'trk_' + Date.now();
+    if (song_id) {
+      db.prepare(`
+        INSERT INTO audio_tracks (id, song_id, title, track_type, audio_url, duration_seconds, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(
+        trackId,
+        song_id,
+        title?.trim() || req.file.originalname,
+        track_type || 'full_song',
+        fileUrl,
+        Number(duration_seconds) || 0,
+        req.file.size,
+        req.file.mimetype,
+        req.file.originalname,
+        req.user!.id
+      );
+
+      logActivity(req.user!.id, req.user!.name, req.user!.role, 'UPLOAD_AUDIO', 'audio_tracks', trackId, `Uploaded audio "${req.file.originalname}" for song ${song_id}`);
+    }
+
+    res.json({
+      track_id: trackId,
+      url: fileUrl,
+      filename: req.file.filename,
+      original_filename: req.file.originalname,
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+      message: 'Idosiye y\'ijwi yashyizwemo neza (Audio file uploaded successfully)'
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Upload failed: ' + (err.message || 'Unknown error') });
+  }
+});
+
+// Single song audio track create
+app.post('/api/admin/songs/:id/audio', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { title, track_type, audio_url, duration_seconds } = req.body;
+
+    if (!title || !audio_url) {
+      return res.status(400).json({ error: 'Umutwe n\'aho ijwi riboneka birakenewe' });
+    }
+
+    const trkId = 'trk_' + Date.now();
+    db.prepare(`
+      INSERT INTO audio_tracks (id, song_id, title, track_type, audio_url, duration_seconds, is_deleted, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(trkId, id, title.trim(), track_type || 'full_song', audio_url, duration_seconds || 0, req.user!.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'ADD_AUDIO_TRACK', 'audio_tracks', trkId, `Added track "${title}" to song ${id}`);
+
+    res.status(201).json({ message: 'Ijwi ryongewemo neza', trackId: trkId });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to add audio track' });
+  }
+});
+
+// Soft delete audio track
+app.delete('/api/admin/audio-tracks/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    db.prepare('UPDATE audio_tracks SET is_deleted = 1 WHERE id = ?').run(req.params.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_AUDIO', 'audio_tracks', req.params.id, `Soft-deleted audio track ${req.params.id}`);
+
+    res.json({ message: 'Ijwi ryasibwe neza' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete audio track' });
+  }
+});
+
+// -------------------------------------------------------------
+// IMAGE UPLOAD & MEDIA LIBRARY
+// -------------------------------------------------------------
+app.get('/api/admin/images', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { category, search } = req.query;
+    let query = `SELECT id, title, category, file_url, file_url as url, file_size_bytes, mime_type, original_filename, width, height, created_by, created_at FROM images WHERE (is_deleted = 0 OR is_deleted IS NULL)`;
+    const params: any[] = [];
+
+    if (category && category !== 'all') {
+      query += ` AND category = ?`;
+      params.push(category);
+    }
+    if (search && typeof search === 'string' && search.trim()) {
+      query += ` AND (title LIKE ? OR original_filename LIKE ?)`;
+      params.push(`%${search.trim()}%`, `%${search.trim()}%`);
+    }
+    query += ` ORDER BY created_at DESC`;
+
+    const images = db.prepare(query).all(...params);
+    res.json(images);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch images' });
+  }
+});
+
+// Explicit save image metadata endpoint (used by Media Library)
+app.post(['/api/admin/images', '/api/images'], requireAdmin, uploadFlexible, (req: AuthRequest, res: Response) => {
+  try {
+    let fileUrl = (req.body?.url || req.body?.file_url || '').trim();
+    let originalFilename = (req.body?.original_filename || '').trim();
+    let fileSize = Number(req.body?.file_size_bytes) || 0;
+    let mimeType = (req.body?.mime_type || 'image/jpeg').trim();
+
+    // If an image file was uploaded with this request
+    if (req.file) {
+      const check = isFileSafeImage(req.file);
+      if (!check.valid) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: check.reason || 'Ubwoko bw\'ifoto ntibwemewe.' });
+      }
+      fileUrl = `/uploads/${req.file.filename}`;
+      originalFilename = req.file.originalname;
+      fileSize = req.file.size;
+      mimeType = req.file.mimetype || 'image/jpeg';
+    }
+
+    if (!fileUrl) {
+      return res.status(400).json({ error: 'Ifoto cyangwa URL y\'ifoto irakenewe (Image or Image URL is required)' });
+    }
+
+    const title = (req.body?.title || originalFilename || 'Ifoto nshya').trim();
+    const category = (req.body?.category || 'general').trim();
+    const imgId = 'img_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+
+    db.prepare(`
+      INSERT INTO images (id, title, category, file_url, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+    `).run(
+      imgId,
+      title,
+      category,
+      fileUrl,
+      fileSize,
+      mimeType,
+      originalFilename,
+      req.user?.id || 'admin'
+    );
+
+    if (req.user) {
+      logActivity(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'SAVE_IMAGE',
+        'images',
+        imgId,
+        `Saved image "${title}" to library (${category})`
+      );
+    }
+
+    res.status(201).json({
+      success: true,
+      id: imgId,
+      title,
+      category,
+      url: fileUrl,
+      file_url: fileUrl,
+      message: 'Ifoto yabitswe mu bubiko neza (Image saved to library successfully)'
+    });
+  } catch (err: any) {
+    console.error('Save image to library failed:', err);
+    res.status(500).json({ error: err.message || 'Failed to save image to library' });
+  }
+});
+
+const handleUnifiedImageUpload = (req: AuthRequest, res: Response) => {
+  try {
+    // If no multipart file, check if base64 data URI was sent in JSON body
+    if (!req.file) {
+      const rawBase64 = req.body?.image || req.body?.file || req.body?.photo || req.body?.dataUrl || req.body?.base64;
+      if (typeof rawBase64 === 'string' && rawBase64.includes('base64,')) {
+        try {
+          const parts = rawBase64.split('base64,');
+          const mimeMatch = parts[0].match(/data:([^;]+);/);
+          const detectedMime = mimeMatch ? mimeMatch[1].toLowerCase() : 'image/jpeg';
+          const ext = MIME_TO_EXT[detectedMime] || '.jpg';
+          const fileBuf = Buffer.from(parts[1], 'base64');
+          const fname = `upload-${Date.now()}-${Math.round(Math.random() * 1e6)}${ext}`;
+          const destPath = path.join(UPLOAD_DIR, fname);
+          fs.writeFileSync(destPath, fileBuf);
+
+          req.file = {
+            fieldname: 'file',
+            originalname: (req.body?.filename || req.body?.title || 'upload') + ext,
+            encoding: '7bit',
+            mimetype: detectedMime,
+            size: fileBuf.length,
+            destination: UPLOAD_DIR,
+            filename: fname,
+            path: destPath,
+            buffer: fileBuf
+          } as Express.Multer.File;
+        } catch (base64Err) {
+          console.warn('Failed to parse base64 image:', base64Err);
+        }
+      }
+    }
+
+    if (!req.file) {
+      return res.status(400).json({ error: 'Nta foto yatoranyijwe (No image selected)' });
+    }
+
+    const check = isFileSafeImage(req.file);
+    if (!check.valid) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(400).json({ error: check.reason || 'Ubwoko bw\'ifoto ntibwemewe.' });
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+    const category = (req.body?.category || 'general').trim();
+    const title = (req.body?.title || req.file.originalname).trim();
+    const imgId = 'img_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+
+    try {
+      db.prepare(`
+        INSERT INTO images (id, title, category, file_url, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
+      `).run(
+        imgId,
+        title,
+        category,
+        fileUrl,
+        req.file.size,
+        req.file.mimetype || 'image/jpeg',
+        req.file.originalname,
+        req.user?.id || 'admin'
+      );
+    } catch (dbErr) {
+      console.warn('[Image Upload] Notice inserting image record into database:', dbErr);
+    }
+
+    if (req.user) {
+      logActivity(
+        req.user.id,
+        req.user.name,
+        req.user.role,
+        'UPLOAD_IMAGE',
+        'images',
+        imgId,
+        `Uploaded image "${req.file.originalname}" (${category})`
+      );
+    }
+
+    return res.status(200).json({
+      success: true,
+      id: imgId,
+      url: fileUrl,
+      file_url: fileUrl,
+      filename: req.file.filename,
+      original_filename: req.file.originalname,
+      size: req.file.size,
+      mimetype: req.file.mimetype,
+      category,
+      message: 'Ifoto yashyizwemo neza (Image uploaded successfully)'
+    });
+  } catch (err: any) {
+    console.error('Image upload failed:', err);
+    return res.status(500).json({ error: 'Habaye ikosa mu gushyiraho ifoto: ' + (err.message || 'Upload failed') });
+  }
+};
+
+// Unified image & media upload endpoint supporting all formats and aliases
+app.post(
+  ['/api/admin/upload/image', '/api/upload/image', '/api/admin/upload', '/api/upload'],
+  requireAdmin,
+  uploadFlexible,
+  handleUnifiedImageUpload
+);
+
+app.delete('/api/admin/images/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    db.prepare('UPDATE images SET is_deleted = 1 WHERE id = ?').run(req.params.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_IMAGE', 'images', req.params.id, `Soft-deleted image ${req.params.id}`);
+
+    res.json({ message: 'Ifoto yasibwe neza' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete image' });
+  }
+});
+
+// -------------------------------------------------------------
+// SONG LYRICS PDF MANAGEMENT & DOWNLOAD/PRINT
+// -------------------------------------------------------------
+
+// Upload or link a PDF version of lyrics to a song (Admin)
+app.post('/api/admin/songs/:id/lyrics-pdf', requireAdmin, upload.single('file'), (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const song = db.prepare('SELECT id, title, song_number, composer, lyrics_pdf_url FROM songs WHERE id = ?').get(id) as any;
+    if (!song) {
+      if (req.file) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+      }
+      return res.status(404).json({ error: 'Indirimbo ntabwo yabonetse (Song not found)' });
+    }
+
+    let fileUrl = '';
+    let filename = '';
+    let fileSize = 0;
+
+    if (req.file) {
+      // File upload mode
+      const ext = path.extname(req.file.originalname).toLowerCase();
+      const isPdf = req.file.mimetype === 'application/pdf' || ext === '.pdf';
+      if (!isPdf) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: 'Ubwoko bw\'idosiye bugomba kuba PDF gusa (.pdf file required)' });
+      }
+      fileUrl = `/uploads/${req.file.filename}`;
+      filename = req.file.originalname;
+      fileSize = req.file.size;
+    } else if (req.body.pdf_url && typeof req.body.pdf_url === 'string' && req.body.pdf_url.trim()) {
+      // Link URL mode
+      fileUrl = req.body.pdf_url.trim();
+      filename = req.body.filename?.trim() || `Indirimbo_${song.song_number || song.id}_Lyrics.pdf`;
+    } else {
+      return res.status(400).json({ error: 'Hitamo idosiye ya PDF cyangwa wandike link ya PDF (Please upload a PDF file or provide a valid PDF link)' });
+    }
+
+    // Update song in database
+    db.prepare(`
+      UPDATE songs
+      SET lyrics_pdf_url = ?, lyrics_pdf_filename = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(fileUrl, filename, id);
+
+    // Also register in documents table for choir document catalog
+    try {
+      const docId = 'doc_pdf_' + Date.now();
+      db.prepare(`
+        INSERT INTO documents (id, title, doc_type, file_url, song_id, file_size_bytes, mime_type, original_filename, status, is_deleted, created_by)
+        VALUES (?, ?, 'sheet_music', ?, ?, ?, 'application/pdf', ?, 'published', 0, ?)
+      `).run(
+        docId,
+        `Lyrics PDF: ${song.song_number ? '#' + song.song_number + ' ' : ''}${song.title}`,
+        fileUrl,
+        id,
+        fileSize,
+        filename,
+        req.user!.id
+      );
+    } catch {}
+
+    // Audit logging
+    const uploadDetails = JSON.stringify({
+      message: `${req.file ? 'Uploaded' : 'Linked'} lyrics PDF "${filename}" for song #${song.song_number || ''} ${song.title}`,
+      previous_url: song.lyrics_pdf_url,
+      new_url: fileUrl,
+      filename
+    });
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      req.file ? 'UPLOAD_LYRICS_PDF' : 'LINK_LYRICS_PDF',
+      'songs',
+      id,
+      uploadDetails
+    );
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'lyrics_pdf_updated',
+      songId: id,
+      lyrics_pdf_url: fileUrl,
+      lyrics_pdf_filename: filename
+    });
+
+    res.json({
+      success: true,
+      message: 'PDF y\'amagambo yashyizwemo neza (Lyrics PDF saved successfully)',
+      lyrics_pdf_url: fileUrl,
+      lyrics_pdf_filename: filename
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Habaye ikibazo mu kubika PDF: ' + (err.message || 'Unknown error') });
+  }
+});
+
+// Remove/unlink lyrics PDF from a song (Admin)
+app.delete('/api/admin/songs/:id/lyrics-pdf', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const song = db.prepare('SELECT id, title, song_number, lyrics_pdf_url, lyrics_pdf_filename FROM songs WHERE id = ?').get(id) as any;
+    if (!song) {
+      return res.status(404).json({ error: 'Indirimbo ntabwo yabonetse (Song not found)' });
+    }
+
+    db.prepare(`
+      UPDATE songs
+      SET lyrics_pdf_url = NULL, lyrics_pdf_filename = NULL, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(id);
+
+    const removeDetails = JSON.stringify({
+      message: `Removed lyrics PDF from song #${song.song_number || ''} ${song.title}`,
+      previous_url: song.lyrics_pdf_url,
+      previous_filename: song.lyrics_pdf_filename
+    });
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'REMOVE_LYRICS_PDF',
+      'songs',
+      id,
+      removeDetails
+    );
+
+    broadcastRealtimeEvent('songs_updated', {
+      action: 'lyrics_pdf_removed',
+      songId: id
+    });
+
+    res.json({
+      success: true,
+      message: 'PDF y\'amagambo yakuweho neza (Lyrics PDF removed successfully)'
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Habaye ikibazo mu gukuraho PDF' });
+  }
+});
+
+// Download or print/view lyrics PDF for any song
+app.get(['/api/songs/:id/pdf', '/api/songs/:id/lyrics-pdf'], optionalAuth, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const song = db.prepare(`
+      SELECT s.*, sc.name as category_name
+      FROM songs s
+      LEFT JOIN song_categories sc ON s.category_id = sc.id
+      WHERE s.id = ?
+    `).get(id) as any;
+
+    if (!song) {
+      return res.status(404).json({ error: 'Indirimbo ntabwo yabonetse (Song not found)' });
+    }
+
+    const lyricsRow = db.prepare('SELECT * FROM lyrics WHERE song_id = ?').get(id) as any;
+
+    const safeNum = song.song_number ? `No_${song.song_number}_` : '';
+    const safeTitle = (song.title || 'Indirimbo').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const defaultFilename = `La_Lumiere_${safeNum}${safeTitle}_Lyrics.pdf`;
+    const finalFilename = song.lyrics_pdf_filename || defaultFilename;
+
+    const isDownload = req.query.download === '1' || req.query.download === 'true';
+    const disposition = isDownload ? 'attachment' : 'inline';
+
+    // If song has an uploaded local PDF file in /uploads
+    if (song.lyrics_pdf_url && song.lyrics_pdf_url.startsWith('/uploads/')) {
+      const localFilePath = path.join(process.cwd(), 'public', song.lyrics_pdf_url);
+      if (fs.existsSync(localFilePath)) {
+        res.setHeader('Content-Type', 'application/pdf');
+        res.setHeader('Content-Disposition', `${disposition}; filename="${finalFilename}"`);
+        return res.sendFile(localFilePath);
+      }
+    }
+
+    // If song has an external link (http/https)
+    if (song.lyrics_pdf_url && (song.lyrics_pdf_url.startsWith('http://') || song.lyrics_pdf_url.startsWith('https://'))) {
+      return res.redirect(song.lyrics_pdf_url);
+    }
+
+    // Generate formatted choir PDF on-the-fly using PDFKit
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `${disposition}; filename="${finalFilename}"`);
+
+    const doc = new PDFDocument({
+      size: 'A4',
+      margins: { top: 40, bottom: 40, left: 45, right: 45 },
+      info: {
+        Title: `${song.song_number ? '#' + song.song_number + ' - ' : ''}${song.title} - Amagambo`,
+        Author: 'ADEPR Nyanza - Korali La Lumiere',
+        Subject: 'Igitabo cy\'Indirimbo (La Lumiere Hymnbook)',
+        Keywords: 'La Lumiere, ADEPR, Choir, Hymns, Lyrics'
+      }
+    });
+
+    doc.pipe(res);
+
+    // Choir Top Branding Header
+    doc
+      .fontSize(9)
+      .fillColor('#64748b')
+      .text('ADEPR NYANZA • KORALI LA LUMIERE • IGITABO CY\'INDIRIMBO', { align: 'center' });
+
+    doc.moveDown(0.3);
+
+    // Decorative line
+    doc
+      .strokeColor('#d97706')
+      .lineWidth(1.5)
+      .moveTo(45, doc.y)
+      .lineTo(550, doc.y)
+      .stroke();
+
+    doc.moveDown(0.8);
+
+    // Song Number & Title
+    if (song.song_number) {
+      doc
+        .fontSize(11)
+        .fillColor('#d97706')
+        .font('Helvetica-Bold')
+        .text(`INDIRIMBO YA ${song.song_number}`, { align: 'center' });
+      doc.moveDown(0.2);
+    }
+
+    doc
+      .fontSize(18)
+      .fillColor('#1e3a8a')
+      .font('Helvetica-Bold')
+      .text(song.title, { align: 'center' });
+
+    doc.moveDown(0.4);
+
+    // Meta details (Category, Composer)
+    const metaParts = [];
+    if (song.category_name) metaParts.push(`Icyiciro: ${song.category_name}`);
+    metaParts.push(`Amahimbaza: ${song.composer || 'La Lumiere Choir'}`);
+    if (song.release_date) metaParts.push(`Tariki: ${song.release_date}`);
+
+    doc
+      .fontSize(9)
+      .fillColor('#475569')
+      .font('Helvetica-Oblique')
+      .text(metaParts.join('  •  '), { align: 'center' });
+
+    doc.moveDown(0.8);
+
+    // Sol-fa notation if present
+    if (lyricsRow?.solfa_notation && lyricsRow.solfa_notation.trim()) {
+      doc
+        .fontSize(9)
+        .font('Courier-Bold')
+        .fillColor('#0284c7')
+        .text('Amanota (Tonic Sol-Fa):', { align: 'left' });
+      doc
+        .fontSize(8.5)
+        .font('Courier')
+        .fillColor('#0f172a')
+        .text(lyricsRow.solfa_notation.trim(), { align: 'left' });
+      doc.moveDown(0.8);
+    }
+
+    // Divider
+    doc
+      .strokeColor('#cbd5e1')
+      .lineWidth(0.5)
+      .moveTo(45, doc.y)
+      .lineTo(550, doc.y)
+      .stroke();
+
+    doc.moveDown(0.8);
+
+    // Song Lyrics Content
+    const lyricsContent = lyricsRow?.content?.trim() || song.description?.trim() || 'Nta magambo yashyizwe muri iyi ndirimbo kugeza ubu.';
+
+    doc
+      .fontSize(10.5)
+      .font('Helvetica')
+      .fillColor('#0f172a')
+      .lineGap(3)
+      .text(lyricsContent, {
+        align: 'left',
+        paragraphGap: 8
+      });
+
+    doc.moveDown(1.5);
+
+    // Footer
+    doc
+      .fontSize(8)
+      .fillColor('#94a3b8')
+      .font('Helvetica')
+      .text(
+        '© Korali La Lumiere - ADEPR Nyanza. Uburenganzira bwose bwarabitswe. Byacapwe binyuze kuri La Lumiere Songbook App.',
+        45,
+        780,
+        { align: 'center', width: 505 }
+      );
+
+    doc.end();
+  } catch (err: any) {
+    res.status(500).json({ error: 'Habaye ikibazo mu gukora PDF: ' + (err.message || 'Unknown error') });
+  }
+});
+
+// -------------------------------------------------------------
+// ANNOUNCEMENTS CMS
+// -------------------------------------------------------------
+app.get('/api/admin/announcements', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const announcements = db.prepare(`
+      SELECT * FROM announcements
+      WHERE (is_deleted = 0 OR is_deleted IS NULL)
+      ORDER BY created_at DESC
+    `).all();
+    res.json(announcements);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch admin announcements' });
+  }
+});
+
+app.post('/api/admin/announcements', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { title, content, category, image_url, status } = req.body;
+    if (!title || !content) {
+      return res.status(400).json({ error: 'Umutwe n\'ubutumwa birakenewe (Title and content required)' });
+    }
+
+    const id = 'ann_' + Date.now();
+    const finalStatus = status === 'draft' ? 'draft' : 'published';
+    const isActive = finalStatus === 'published' ? 1 : 0;
+
+    db.prepare(`
+      INSERT INTO announcements (id, title, content, category, image_url, status, is_active, is_deleted, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(id, title.trim(), content.trim(), category || 'general', image_url || '', finalStatus, isActive, req.user!.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'CREATE_ANNOUNCEMENT', 'announcements', id, `Created announcement "${title}" (${finalStatus})`);
+
+    res.status(201).json({ message: 'Itangazo ryashyizwemo neza', id });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to create announcement' });
+  }
+});
+
+app.put('/api/admin/announcements/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { title, content, category, image_url, status } = req.body;
+    const finalStatus = status === 'draft' ? 'draft' : 'published';
+    const isActive = finalStatus === 'published' ? 1 : 0;
+
+    db.prepare(`
+      UPDATE announcements
+      SET title = ?, content = ?, category = ?, image_url = ?, status = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(title.trim(), content.trim(), category || 'general', image_url || '', finalStatus, isActive, id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'UPDATE_ANNOUNCEMENT', 'announcements', id, `Updated announcement "${title}"`);
+
+    res.json({ message: 'Itangazo ryavuguruwe neza' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update announcement' });
+  }
+});
+
+app.delete('/api/admin/announcements/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    db.prepare('UPDATE announcements SET is_deleted = 1, is_active = 0 WHERE id = ?').run(id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_ANNOUNCEMENT', 'announcements', id, `Soft-deleted announcement ${id}`);
+
+    res.json({ message: 'Itangazo ryasibwe neza' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete announcement' });
+  }
+});
+
+app.patch('/api/admin/announcements/:id/status', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+    const finalStatus = status === 'draft' ? 'draft' : 'published';
+    const isActive = finalStatus === 'published' ? 1 : 0;
+
+    db.prepare('UPDATE announcements SET status = ?, is_active = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(finalStatus, isActive, id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'STATUS_CHANGE', 'announcements', id, `Changed announcement status to ${finalStatus}`);
+
+    res.json({ message: `Imimerere y\'itangazo yahinduwe kuri ${finalStatus}`, status: finalStatus });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to update status' });
+  }
+});
+
+// -------------------------------------------------------------
+// EVENTS CMS (Full-Featured with Real-time & Interested Registrations)
+// -------------------------------------------------------------
+app.get('/api/admin/events', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { search, category, status, include_deleted } = req.query;
+
+    let query = `
+      SELECT e.*,
+             (SELECT COUNT(*) FROM event_interested ei WHERE ei.event_id = e.id) as interested_count
+      FROM events e
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (include_deleted !== 'true') {
+      query += ` AND (e.is_deleted = 0 OR e.is_deleted IS NULL)`;
+    }
+
+    if (category && category !== 'all') {
+      query += ` AND LOWER(e.category) = LOWER(?)`;
+      params.push(String(category).trim());
+    }
+
+    if (status && status !== 'all') {
+      query += ` AND (e.status = ? OR e.event_status = ?)`;
+      params.push(status, status);
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (e.title LIKE ? OR e.location LIKE ? OR e.description LIKE ?)`;
+      params.push(term, term, term);
+    }
+
+    query += ` ORDER BY e.event_date DESC, e.created_at DESC`;
+
+    const events = db.prepare(query).all(...params) as any[];
+
+    // Fetch quick preview of interested users for each event
+    const eventsWithUsers = events.map(ev => {
+      const interestedUsers = db.prepare(`
+        SELECT u.id as user_id, u.name, u.email, u.phone, u.avatar_url, u.role, u.choir_voice, ei.created_at
+        FROM event_interested ei
+        JOIN users u ON ei.user_id = u.id
+        WHERE ei.event_id = ?
+        ORDER BY ei.created_at DESC
+        LIMIT 6
+      `).all(ev.id);
+
+      return {
+        ...ev,
+        interested_count: Number(ev.interested_count || 0),
+        interested_users: interestedUsers,
+      };
+    });
+
+    res.json(eventsWithUsers);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch admin events' });
+  }
+});
+
+app.get('/api/admin/events/:id/interested-users', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const event = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as any;
+    if (!event) {
+      return res.status(404).json({ error: 'Igikorwa ntikibonetse' });
+    }
+
+    const users = db.prepare(`
+      SELECT u.id as user_id, u.name, u.email, u.phone, u.avatar_url, u.role, u.choir_voice, u.choir_role, ei.created_at
+      FROM event_interested ei
+      JOIN users u ON ei.user_id = u.id
+      WHERE ei.event_id = ?
+      ORDER BY ei.created_at DESC
+    `).all(id);
+
+    res.json({
+      event: {
+        id: event.id,
+        title: event.title,
+        category: event.category,
+        event_date: event.event_date,
+        location: event.location,
+      },
+      total_interested: users.length,
+      users,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch interested users' });
+  }
+});
+
+app.post(['/api/admin/events', '/api/events'], requireAdmin, uploadFlexible, (req: AuthRequest, res) => {
+  try {
+    const {
+      title,
+      category,
+      description,
+      event_date,
+      start_time,
+      end_time,
+      location,
+      image_url,
+      status,
+      event_status,
+    } = req.body;
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: 'Umutwe w\'igikorwa urakenewe (Event title required)' });
+    }
+    if (!event_date || !event_date.trim()) {
+      return res.status(400).json({ error: 'Itariki y\'igikorwa irakenewe (Event date required)' });
+    }
+
+    // Direct image upload support via multipart/form-data
+    let finalImageUrl = image_url ? String(image_url).trim() : '';
+    if (req.file) {
+      const check = isFileSafeImage(req.file);
+      if (!check.valid) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: check.reason || 'Ubwoko bw\'ifoto ntibwemewe.' });
+      }
+      finalImageUrl = `/uploads/${req.file.filename}`;
+      try {
+        db.prepare(`
+          INSERT INTO images (id, title, category, file_url, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+          VALUES (?, ?, 'event_image', ?, ?, ?, ?, ?, 0)
+        `).run(
+          'img_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+          title.trim(),
+          finalImageUrl,
+          req.file.size,
+          req.file.mimetype || 'image/jpeg',
+          req.file.originalname,
+          req.user?.id || 'admin'
+        );
+      } catch (imgErr) {
+        console.warn('Notice recording event poster image:', imgErr);
+      }
+    }
+
+    const id = 'ev_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6);
+    const finalStatus = status === 'draft' ? 'draft' : 'published';
+    const finalEventStatus = ['upcoming', 'ongoing', 'completed', 'cancelled'].includes(event_status)
+      ? event_status
+      : 'upcoming';
+    const finalCategory = category?.trim() || 'Choir Practice';
+
+    db.prepare(`
+      INSERT INTO events (
+        id, title, category, description, event_date, start_time, end_time,
+        location, image_url, status, event_status, is_deleted, created_by
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(
+      id,
+      title.trim(),
+      finalCategory,
+      description?.trim() || '',
+      event_date.trim(),
+      start_time?.trim() || '15:00',
+      end_time?.trim() || '18:00',
+      location?.trim() || '',
+      finalImageUrl,
+      finalStatus,
+      finalEventStatus,
+      req.user!.id
+    );
+
+    const createdEvent = db.prepare(`
+      SELECT e.*, 0 as interested_count
+      FROM events e WHERE e.id = ?
+    `).get(id) as any;
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'CREATE_EVENT',
+      'events',
+      id,
+      `Yashyizeho igikorwa gishya "${title.trim()}" kuri itariki ya ${event_date}`
+    );
+
+    // Broadcast real-time event creation via SSE
+    broadcastRealtimeEvent('events:created', { event: createdEvent });
+
+    res.status(201).json({
+      message: 'Igikorwa cyashyizwemo neza (Event created successfully)',
+      event: createdEvent,
+      id,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create event' });
+  }
+});
+
+app.put(['/api/admin/events/:id', '/api/events/:id'], requireAdmin, uploadFlexible, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      title,
+      category,
+      description,
+      event_date,
+      start_time,
+      end_time,
+      location,
+      image_url,
+      status,
+      event_status,
+    } = req.body;
+
+    if (!title || !title.trim()) {
+      return res.status(400).json({ error: 'Umutwe w\'igikorwa urakenewe' });
+    }
+    if (!event_date || !event_date.trim()) {
+      return res.status(400).json({ error: 'Itariki y\'igikorwa irakenewe' });
+    }
+
+    const previousEvent = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as any;
+    if (!previousEvent) {
+      return res.status(404).json({ error: 'Igikorwa ntikibonetse (Event not found)' });
+    }
+
+    let finalImageUrl = image_url !== undefined
+      ? (image_url ? String(image_url).trim() : '')
+      : (previousEvent?.image_url || '');
+
+    if (req.file) {
+      const check = isFileSafeImage(req.file);
+      if (!check.valid) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+        return res.status(400).json({ error: check.reason || 'Ubwoko bw\'ifoto ntibwemewe.' });
+      }
+      finalImageUrl = `/uploads/${req.file.filename}`;
+      try {
+        db.prepare(`
+          INSERT INTO images (id, title, category, file_url, file_size_bytes, mime_type, original_filename, created_by, is_deleted)
+          VALUES (?, ?, 'event_image', ?, ?, ?, ?, ?, 0)
+        `).run(
+          'img_' + Date.now() + '_' + Math.random().toString(36).substring(2, 6),
+          (title || req.file.originalname).trim(),
+          finalImageUrl,
+          req.file.size,
+          req.file.mimetype || 'image/jpeg',
+          req.file.originalname,
+          req.user?.id || 'admin'
+        );
+      } catch (imgErr) {
+        console.warn('Notice recording event poster image:', imgErr);
+      }
+    }
+
+    db.prepare(`
+      UPDATE events
+      SET title = ?,
+          category = ?,
+          description = ?,
+          event_date = ?,
+          start_time = ?,
+          end_time = ?,
+          location = ?,
+          image_url = ?,
+          status = COALESCE(?, status),
+          event_status = COALESCE(?, event_status),
+          updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      title.trim(),
+      category?.trim() || 'Choir Practice',
+      description?.trim() || '',
+      event_date.trim(),
+      start_time?.trim() || '15:00',
+      end_time?.trim() || '18:00',
+      location?.trim() || '',
+      finalImageUrl,
+      status || 'published',
+      event_status || 'upcoming',
+      id
+    );
+
+    const updatedEvent = db.prepare(`
+      SELECT e.*,
+             (SELECT COUNT(*) FROM event_interested ei WHERE ei.event_id = e.id) as interested_count
+      FROM events e WHERE e.id = ?
+    `).get(id) as any;
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'UPDATE_EVENT',
+      'events',
+      id,
+      `Yavuguruye igikorwa "${title.trim()}"`
+    );
+
+    // Broadcast real-time update via SSE
+    broadcastRealtimeEvent('events:updated', { event: updatedEvent });
+
+    res.json({
+      message: 'Igikorwa cyavuguruwe neza (Event updated successfully)',
+      event: updatedEvent,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to update event' });
+  }
+});
+
+app.delete('/api/admin/events/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const event = db.prepare('SELECT title FROM events WHERE id = ?').get(id) as any;
+
+    db.prepare('UPDATE events SET is_deleted = 1, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(id);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'DELETE_EVENT',
+      'events',
+      id,
+      `Yasibye igikorwa "${event?.title || id}"`
+    );
+
+    // Broadcast real-time deletion via SSE
+    broadcastRealtimeEvent('events:deleted', { id });
+
+    res.json({ message: 'Igikorwa cyasibwe neza (Event deleted successfully)', id });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to delete event' });
+  }
+});
+
+app.patch('/api/admin/events/:id/status', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { status, event_status } = req.body;
+
+    const event = db.prepare('SELECT * FROM events WHERE id = ?').get(id) as any;
+    if (!event) {
+      return res.status(404).json({ error: 'Igikorwa ntikibonetse' });
+    }
+
+    const finalStatus = status !== undefined ? (status === 'draft' ? 'draft' : 'published') : event.status;
+    const finalEventStatus = event_status !== undefined ? event_status : event.event_status;
+
+    db.prepare(`
+      UPDATE events
+      SET status = ?, event_status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(finalStatus, finalEventStatus, id);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'STATUS_CHANGE',
+      'events',
+      id,
+      `Yahinduye status y'igikorwa "${event.title}": ${finalStatus} (${finalEventStatus})`
+    );
+
+    const updated = db.prepare(`
+      SELECT e.*, (SELECT COUNT(*) FROM event_interested ei WHERE ei.event_id = e.id) as interested_count
+      FROM events e WHERE e.id = ?
+    `).get(id);
+
+    // Broadcast real-time update
+    broadcastRealtimeEvent('events:updated', { event: updated });
+
+    res.json({
+      message: `Imimerere yahinduwe neza`,
+      status: finalStatus,
+      event_status: finalEventStatus,
+      event: updated,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update event status' });
+  }
+});
+
+app.patch('/api/admin/events/:id/cancel', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const event = db.prepare('SELECT title FROM events WHERE id = ?').get(id) as any;
+    if (!event) {
+      return res.status(404).json({ error: 'Igikorwa ntikibonetse' });
+    }
+
+    db.prepare(`
+      UPDATE events
+      SET event_status = 'cancelled', updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(id);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'CANCEL_EVENT',
+      'events',
+      id,
+      `Yahagaritse igikorwa "${event.title}"`
+    );
+
+    const updated = db.prepare('SELECT * FROM events WHERE id = ?').get(id);
+
+    // Broadcast real-time cancellation
+    broadcastRealtimeEvent('events:cancelled', { id, event: updated });
+
+    res.json({
+      message: 'Igikorwa cyahagaritswe neza (Event marked as cancelled)',
+      event: updated,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to cancel event' });
+  }
+});
+
+// -------------------------------------------------------------
+// DOCUMENTS CMS (Sheet Music, Solfa, Guides)
+// -------------------------------------------------------------
+app.get('/api/admin/documents', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const docs = db.prepare(`
+      SELECT d.*, s.title as song_title
+      FROM documents d
+      LEFT JOIN songs s ON d.song_id = s.id
+      WHERE (d.is_deleted = 0 OR d.is_deleted IS NULL)
+      ORDER BY d.created_at DESC
+    `).all();
+    res.json(docs);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch admin documents' });
+  }
+});
+
+app.post('/api/admin/upload/document', requireAdmin, upload.single('file'), (req: AuthRequest, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Nta nyandiko yatoranyijwe (No document uploaded)' });
+    }
+
+    const fileUrl = `/uploads/${req.file.filename}`;
+    const { title, doc_type, song_id, status } = req.body;
+    const docId = 'doc_' + Date.now();
+
+    db.prepare(`
+      INSERT INTO documents (id, title, doc_type, file_url, song_id, file_size_bytes, mime_type, original_filename, status, is_deleted, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(
+      docId,
+      title?.trim() || req.file.originalname,
+      doc_type || 'sheet_music',
+      fileUrl,
+      song_id || null,
+      req.file.size,
+      req.file.mimetype,
+      req.file.originalname,
+      status || 'published',
+      req.user!.id
+    );
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'UPLOAD_DOCUMENT', 'documents', docId, `Uploaded document "${req.file.originalname}"`);
+
+    res.json({
+      id: docId,
+      url: fileUrl,
+      filename: req.file.filename,
+      original_filename: req.file.originalname,
+      message: 'Inyandiko yashyizwemo neza (Document uploaded successfully)'
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Document upload failed' });
+  }
+});
+
+app.delete('/api/admin/documents/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    db.prepare('UPDATE documents SET is_deleted = 1 WHERE id = ?').run(req.params.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_DOCUMENT', 'documents', req.params.id, `Soft-deleted document ${req.params.id}`);
+
+    res.json({ message: 'Inyandiko yasibwe neza' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete document' });
+  }
+});
+
+// -------------------------------------------------------------
+// CONTENT ARTICLES (Choir News, Devotionals, Videos, Notices)
+// -------------------------------------------------------------
+app.get('/api/admin/content-articles', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const articles = db.prepare(`
+      SELECT * FROM content_articles
+      WHERE (is_deleted = 0 OR is_deleted IS NULL)
+      ORDER BY created_at DESC
+    `).all();
+    res.json(articles);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch content articles' });
+  }
+});
+
+app.post('/api/admin/content-articles', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { title, type, content, summary, cover_image_url, video_url, status } = req.body;
+    if (!title || !content) {
+      return res.status(400).json({ error: 'Umutwe n\'ibiri mu nyandiko birakenewe' });
+    }
+
+    const id = 'art_' + Date.now();
+    const finalStatus = status === 'draft' ? 'draft' : 'published';
+
+    db.prepare(`
+      INSERT INTO content_articles (id, title, type, content, summary, cover_image_url, video_url, status, is_deleted, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+    `).run(
+      id,
+      title.trim(),
+      type || 'news',
+      content.trim(),
+      summary?.trim() || '',
+      cover_image_url || '',
+      video_url || '',
+      finalStatus,
+      req.user!.id
+    );
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'CREATE_ARTICLE', 'content_articles', id, `Created article "${title}" (${type})`);
+
+    res.status(201).json({ message: 'Ingingo yashyizwemo neza', id });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to create article' });
+  }
+});
+
+app.put('/api/admin/content-articles/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { title, type, content, summary, cover_image_url, video_url, status } = req.body;
+
+    db.prepare(`
+      UPDATE content_articles
+      SET title = ?, type = ?, content = ?, summary = ?, cover_image_url = ?, video_url = ?, status = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(
+      title.trim(),
+      type || 'news',
+      content.trim(),
+      summary?.trim() || '',
+      cover_image_url || '',
+      video_url || '',
+      status || 'published',
+      id
+    );
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'UPDATE_ARTICLE', 'content_articles', id, `Updated article "${title}"`);
+
+    res.json({ message: 'Ingingo yavuguruwe neza' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update article' });
+  }
+});
+
+app.delete('/api/admin/content-articles/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    db.prepare('UPDATE content_articles SET is_deleted = 1 WHERE id = ?').run(id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_ARTICLE', 'content_articles', id, `Soft-deleted article ${id}`);
+
+    res.json({ message: 'Ingingo yasibwe neza' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete article' });
+  }
+});
+
+// -------------------------------------------------------------
+// COMMENTS MODERATION
+// -------------------------------------------------------------
+app.get('/api/admin/comments', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { status, song_id, search } = req.query;
+    let query = `
+      SELECT c.*, u.name as user_name, u.email as user_email, u.is_disabled as user_disabled, s.title as song_title
+      FROM comments c
+      JOIN users u ON c.user_id = u.id
+      JOIN songs s ON c.song_id = s.id
+      WHERE (c.is_deleted = 0 OR c.is_deleted IS NULL)
+    `;
+    const params: any[] = [];
+
+    if (status && status !== 'all') {
+      query += ` AND c.status = ?`;
+      params.push(status);
+    }
+    if (song_id && song_id !== 'all') {
+      query += ` AND c.song_id = ?`;
+      params.push(song_id);
+    }
+    if (search && typeof search === 'string') {
+      query += ` AND (c.content LIKE ? OR u.name LIKE ? OR s.title LIKE ?)`;
+      params.push(`%${search}%`, `%${search}%`, `%${search}%`);
+    }
+
+    query += ` ORDER BY c.created_at DESC LIMIT 100`;
+
+    const comments = db.prepare(query).all(...params);
+    res.json(comments);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch comments for moderation' });
+  }
+});
+
+app.put('/api/admin/comments/:id/status', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { status } = req.body; // 'visible', 'hidden', 'flagged'
+    if (!['visible', 'hidden', 'flagged'].includes(status)) {
+      return res.status(400).json({ error: 'Status itemewe' });
+    }
+
+    db.prepare('UPDATE comments SET status = ? WHERE id = ?').run(status, req.params.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'MODERATE_COMMENT', 'comments', req.params.id, `Comment status set to ${status}`);
+
+    res.json({ message: `Imimerere y\'igitekerezo yahinduwe kuri ${status}` });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update comment status' });
+  }
+});
+
+app.delete('/api/admin/comments/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    db.prepare('UPDATE comments SET is_deleted = 1 WHERE id = ?').run(req.params.id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_COMMENT', 'comments', req.params.id, `Soft-deleted comment ${req.params.id}`);
+
+    res.json({ message: 'Igitekerezo cyasibwe neza' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to delete comment' });
+  }
+});
+
+// Block/disable a user who wrote abusive comments
+app.post('/api/admin/users/:id/block', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    db.prepare('UPDATE users SET is_disabled = 1 WHERE id = ?').run(id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'BLOCK_USER', 'users', id, `Blocked/disabled user account ${id}`);
+
+    res.json({ message: 'Konti y\'umukoresha yahagaritswe (User blocked)' });
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to block user' });
+  }
+});
+
+// -------------------------------------------------------------
+// USER MANAGEMENT & ROLE-BASED ACCESS CONTROL
+// -------------------------------------------------------------
+app.get('/api/admin/roles', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const roles = db.prepare('SELECT * FROM roles ORDER BY id ASC').all();
+    res.json(roles);
+  } catch (err) {
+    res.status(500).json({ error: 'Failed to fetch roles' });
+  }
+});
+
+app.get('/api/admin/users', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { search, role, status } = req.query;
+    let query = `
+      SELECT id, name, email, phone, role, avatar_url, is_disabled, created_at,
+             (SELECT COUNT(*) FROM comments c WHERE c.user_id = u.id) as comments_count,
+             (SELECT COUNT(*) FROM payment_transactions pt WHERE pt.user_id = u.id AND pt.status = 'successful') as donations_count
+      FROM users u
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (role && role !== 'all') {
+      query += ` AND u.role = ?`;
+      params.push(role);
+    }
+
+    if (status === 'active') {
+      query += ` AND (u.is_disabled = 0 OR u.is_disabled IS NULL)`;
+    } else if (status === 'disabled') {
+      query += ` AND u.is_disabled = 1`;
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ?)`;
+      params.push(term, term, term);
+    }
+
+    query += ` ORDER BY u.created_at DESC`;
+    const users = db.prepare(query).all(...params);
+    res.json(users);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch users' });
+  }
+});
+
+app.all('/api/admin/users/:id/role', requireSuperAdmin, (req: AuthRequest, res) => {
+  if (req.method !== 'PUT' && req.method !== 'PATCH') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  try {
+    const { id } = req.params;
+    const { role } = req.body;
+
+    const validRoles = ['super_admin', 'admin', 'content_admin', 'moderator', 'normal_user', 'member', 'supporter', 'choir_member'];
+    if (!validRoles.includes(role)) {
+      return res.status(400).json({ error: 'Inshingano itemewe (Invalid role)' });
+    }
+
+    // Protect super admin account from demoting themselves accidentally
+    if (id === req.user!.id && role !== 'super_admin') {
+      return res.status(400).json({ error: 'Ntushobora kwikuraho ubuyobozi bukuru (Cannot demote yourself)' });
+    }
+
+    db.prepare('UPDATE users SET role = ? WHERE id = ?').run(role, id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'CHANGE_USER_ROLE', 'users', id, `Changed role of user ${id} to ${role}`);
+
+    res.json({ message: `Inshingano zahinduwe kuri ${role}`, role });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update user role' });
+  }
+});
+
+app.all('/api/admin/users/:id/status', requireSuperAdmin, (req: AuthRequest, res) => {
+  if (req.method !== 'PUT' && req.method !== 'PATCH') {
+    return res.status(405).json({ error: 'Method not allowed' });
+  }
+  try {
+    const { id } = req.params;
+    const { is_disabled } = req.body;
+
+    if (id === req.user!.id) {
+      return res.status(400).json({ error: 'Ntushobora guhagarika konti yawe bwite (Cannot disable yourself)' });
+    }
+
+    const disabledVal = is_disabled ? 1 : 0;
+    db.prepare('UPDATE users SET is_disabled = ? WHERE id = ?').run(disabledVal, id);
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'CHANGE_USER_STATUS', 'users', id, `${disabledVal ? 'Disabled' : 'Enabled'} user account ${id}`);
+
+    res.json({ message: `Konti y\'umukoresha ${disabledVal ? 'yahagaritswe' : 'yakomorewe'} neza`, is_disabled: disabledVal === 1 });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update user status' });
+  }
+});
+
+// Bulk User Removal / Disabling Endpoint with Comprehensive Audit Logging
+app.post('/api/admin/users/bulk-remove', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { userIds, action = 'disable', reason = 'Administrative bulk user action' } = req.body;
+
+    if (!Array.isArray(userIds) || userIds.length === 0) {
+      return res.status(400).json({ error: 'Hitamo byibura umukoresha umwe (Select at least one user)' });
+    }
+
+    const currentUserId = req.user!.id;
+    const sanitizedIds = userIds.filter((uid: any) => typeof uid === 'string' && uid.trim().length > 0);
+
+    if (sanitizedIds.length === 0) {
+      return res.status(400).json({ error: 'Nta ID z\'abakoresha zikwiye zatanzwe' });
+    }
+
+    // Protection: do not allow bulk removal of current user
+    if (sanitizedIds.includes(currentUserId)) {
+      return res.status(400).json({ error: 'Ntushobora kwikuraho wowe ubwawe muri iki gikorwa (Cannot remove yourself in bulk action)' });
+    }
+
+    // Fetch existing records for audit trail evidence
+    const placeholders = sanitizedIds.map(() => '?').join(',');
+    const targetUsers = db.prepare(`SELECT id, name, email, phone, role, is_disabled FROM users WHERE id IN (${placeholders})`).all(...sanitizedIds) as any[];
+
+    if (targetUsers.length === 0) {
+      return res.status(404).json({ error: 'Nta banyamuryango babonetse b\'izo ID zatanzwe' });
+    }
+
+    // Protect super admins from being removed by non-super-admins
+    const hasSuperAdmin = targetUsers.some(u => u.role === 'super_admin');
+    if (hasSuperAdmin && req.user!.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Ntabwo wemerewe gukuraho abayobozi bakuru (Super Admin accounts cannot be removed)' });
+    }
+
+    const finalTargetIds = targetUsers.map(u => u.id);
+    const finalPlaceholders = finalTargetIds.map(() => '?').join(',');
+    const isHardDelete = action === 'delete';
+
+    // Execute in transaction
+    db.exec('BEGIN TRANSACTION;');
+    try {
+      if (isHardDelete) {
+        db.prepare(`DELETE FROM comments WHERE user_id IN (${finalPlaceholders})`).run(...finalTargetIds);
+        db.prepare(`DELETE FROM favorites WHERE user_id IN (${finalPlaceholders})`).run(...finalTargetIds);
+        db.prepare(`DELETE FROM notifications WHERE user_id IN (${finalPlaceholders})`).run(...finalTargetIds);
+        db.prepare(`DELETE FROM event_interested WHERE user_id IN (${finalPlaceholders})`).run(...finalTargetIds);
+        db.prepare(`DELETE FROM users WHERE id IN (${finalPlaceholders})`).run(...finalTargetIds);
+      } else {
+        db.prepare(`UPDATE users SET is_disabled = 1 WHERE id IN (${finalPlaceholders})`).run(...finalTargetIds);
+      }
+      db.exec('COMMIT;');
+    } catch (txErr) {
+      db.exec('ROLLBACK;');
+      throw txErr;
+    }
+
+    // Immutable audit trail recording
+    const affectedSummary = targetUsers.map(u => `${u.name || 'User'} (${u.email || u.id})`).slice(0, 5).join(', ');
+    const extraCount = targetUsers.length > 5 ? ` and ${targetUsers.length - 5} more` : '';
+    const auditAction = isHardDelete ? 'BULK_USER_DELETE' : 'BULK_USER_DISABLE';
+    const auditDetails = JSON.stringify({
+      actionType: 'BULK_USER_REMOVAL',
+      mode: isHardDelete ? 'permanent_delete' : 'disable',
+      count: targetUsers.length,
+      reason,
+      operator: {
+        id: req.user!.id,
+        name: req.user!.name,
+        role: req.user!.role
+      },
+      affectedUsers: targetUsers.map(u => ({
+        id: u.id,
+        name: u.name,
+        email: u.email,
+        role: u.role
+      })),
+      summary: `Bulk ${isHardDelete ? 'permanently deleted' : 'disabled'} ${targetUsers.length} user account(s): ${affectedSummary}${extraCount}`
+    });
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      auditAction,
+      'users',
+      undefined,
+      auditDetails
+    );
+
+    res.json({
+      success: true,
+      count: targetUsers.length,
+      action: isHardDelete ? 'delete' : 'disable',
+      message: `Abanyamuryango ${targetUsers.length} ${isHardDelete ? 'basibwe burundu' : 'bahagaritswe'} neza`,
+      affectedUsers: targetUsers.map(u => ({ id: u.id, name: u.name }))
+    });
+  } catch (err: any) {
+    console.error('Bulk user removal error:', err);
+    res.status(500).json({ error: err.message || 'Failed to execute bulk user removal' });
+  }
+});
+
+// Single User Permanent Removal with Audit Logging
+app.delete('/api/admin/users/:id', requireSuperAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    if (id === req.user!.id) {
+      return res.status(400).json({ error: 'Ntushobora kwisiba wowe ubwawe (Cannot delete yourself)' });
+    }
+
+    const targetUser = db.prepare('SELECT id, name, email, role FROM users WHERE id = ?').get(id) as any;
+    if (!targetUser) {
+      return res.status(404).json({ error: 'Umukoresha ntabwo yabonetse' });
+    }
+
+    db.exec('BEGIN TRANSACTION;');
+    try {
+      db.prepare('DELETE FROM comments WHERE user_id = ?').run(id);
+      db.prepare('DELETE FROM favorites WHERE user_id = ?').run(id);
+      db.prepare('DELETE FROM notifications WHERE user_id = ?').run(id);
+      db.prepare('DELETE FROM event_interests WHERE user_id = ?').run(id);
+      db.prepare('DELETE FROM users WHERE id = ?').run(id);
+      db.exec('COMMIT;');
+    } catch (txErr) {
+      db.exec('ROLLBACK;');
+      throw txErr;
+    }
+
+    const auditDetails = JSON.stringify({
+      actionType: 'DELETE_USER',
+      targetUserId: id,
+      targetName: targetUser.name,
+      targetEmail: targetUser.email,
+      targetRole: targetUser.role,
+      operator: { id: req.user!.id, name: req.user!.name, role: req.user!.role },
+      summary: `Permanently removed user account: ${targetUser.name} (${targetUser.email}, ${targetUser.role})`
+    });
+
+    logActivity(req.user!.id, req.user!.name, req.user!.role, 'DELETE_USER', 'users', id, auditDetails);
+
+    res.json({ message: 'Umukoresha yasibwe burundu neza (User deleted permanently)', id });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to delete user' });
+  }
+});
+
+// Member Directory API with server-side role verification
+app.get('/api/admin/members', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { search, role, status } = req.query;
+    let query = `
+      SELECT id, name, email, phone, role, avatar_url, choir_voice, choir_role, is_disabled, created_at,
+             (SELECT COUNT(*) FROM comments c WHERE c.user_id = u.id) as comments_count,
+             (SELECT COUNT(*) FROM payment_transactions pt WHERE pt.user_id = u.id AND pt.status = 'successful') as donations_count
+      FROM users u
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (role && role !== 'all') {
+      query += ` AND u.role = ?`;
+      params.push(role);
+    }
+
+    if (status === 'active') {
+      query += ` AND (u.is_disabled = 0 OR u.is_disabled IS NULL)`;
+    } else if (status === 'disabled') {
+      query += ` AND u.is_disabled = 1`;
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (u.name LIKE ? OR u.email LIKE ? OR u.phone LIKE ? OR u.choir_voice LIKE ? OR u.choir_role LIKE ?)`;
+      params.push(term, term, term, term, term);
+    }
+
+    query += ` ORDER BY u.created_at DESC`;
+    const members = db.prepare(query).all(...params);
+    res.json(members);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch admin members' });
+  }
+});
+
+// Member Statistics API using Recharts data formats
+app.get('/api/admin/members/stats', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const roleRows = db.prepare(`
+      SELECT 
+        CASE 
+          WHEN role IN ('super_admin', 'admin') THEN 'Admin'
+          WHEN role IN ('choir_member', 'member', 'content_admin', 'moderator') THEN 'Member'
+          ELSE 'User'
+        END as group_name,
+        role,
+        COUNT(*) as count
+      FROM users
+      GROUP BY role
+    `).all() as any[];
+
+    let adminCount = 0;
+    let memberCount = 0;
+    let userCount = 0;
+    const breakdownByRole: Record<string, number> = {};
+
+    for (const r of roleRows) {
+      breakdownByRole[r.role] = r.count;
+      if (r.group_name === 'Admin') adminCount += r.count;
+      else if (r.group_name === 'Member') memberCount += r.count;
+      else userCount += r.count;
+    }
+
+    const roleDistribution = [
+      { name: 'Admin', count: adminCount, fill: '#1e3a8a' },
+      { name: 'Member', count: memberCount, fill: '#059669' },
+      { name: 'User', count: userCount, fill: '#d97706' },
+    ];
+
+    const trendsRows = db.prepare(`
+      SELECT 
+        strftime('%Y-%m', created_at) as month,
+        COUNT(*) as registrations,
+        SUM(CASE WHEN role IN ('super_admin', 'admin') THEN 1 ELSE 0 END) as admins,
+        SUM(CASE WHEN role IN ('choir_member', 'member', 'content_admin', 'moderator') THEN 1 ELSE 0 END) as members,
+        SUM(CASE WHEN role NOT IN ('super_admin', 'admin', 'choir_member', 'member', 'content_admin', 'moderator') THEN 1 ELSE 0 END) as users
+      FROM users
+      WHERE created_at >= date('now', '-6 months')
+      GROUP BY strftime('%Y-%m', created_at)
+      ORDER BY month ASC
+    `).all() as any[];
+
+    const registrationTrends = trendsRows.length > 0
+      ? trendsRows.map(t => ({
+          month: t.month || 'Current',
+          registrations: t.registrations || 0,
+          admins: t.admins || 0,
+          members: t.members || 0,
+          users: t.users || 0,
+        }))
+      : [
+          { month: 'Bungura', registrations: adminCount + memberCount + userCount, admins: adminCount, members: memberCount, users: userCount }
+        ];
+
+    const totalUsers = adminCount + memberCount + userCount;
+    const activeCount = (db.prepare('SELECT COUNT(*) as c FROM users WHERE is_disabled = 0 OR is_disabled IS NULL').get() as any)?.c || 0;
+    const disabledCount = (db.prepare('SELECT COUNT(*) as c FROM users WHERE is_disabled = 1').get() as any)?.c || 0;
+
+    res.json({
+      totalUsers,
+      activeCount,
+      disabledCount,
+      roleDistribution,
+      registrationTrends,
+      breakdownByRole
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to load member statistics' });
+  }
+});
+
+// -------------------------------------------------------------
+// SECURE CSV DATA EXPORT APIS (Full-featured with UTF-8 BOM, Sanitization, Date Filters, Streaming)
+// -------------------------------------------------------------
+
+// Dedicated CSV Export for Choir Members (with server-side auth, date filtering, and stream formatting)
+app.get('/api/admin/export/members', requireAdmin, (req: AuthRequest, res: express.Response) => {
+  try {
+    const { headers, rows, filename } = getMembersData(req.query);
+    streamCsvResponse(res, filename, headers, rows);
+  } catch (err: any) {
+    console.error('Members CSV export stream error:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu gutegura dosiye ya CSV y\'abanyamuryango (Failed to export members)' });
+  }
+});
+
+// Dedicated CSV Export for Donations & Payment Transactions
+app.get('/api/admin/export/donations', requireAdmin, (req: AuthRequest, res: express.Response) => {
+  try {
+    const { headers, rows, filename } = getDonationsData(req.query);
+    streamCsvResponse(res, filename, headers, rows);
+  } catch (err: any) {
+    console.error('Donations CSV export stream error:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu gutegura dosiye ya CSV y\'inkunga (Failed to export donations)' });
+  }
+});
+
+// Dedicated CSV Export for Choir Events & Activities
+app.get('/api/admin/export/events', requireAdmin, (req: AuthRequest, res: express.Response) => {
+  try {
+    const { headers, rows, filename } = getEventsData(req.query);
+    streamCsvResponse(res, filename, headers, rows);
+  } catch (err: any) {
+    console.error('Events CSV export stream error:', err);
+    res.status(500).json({ error: err.message || 'Habaye ikosa mu gutegura dosiye ya CSV y\'ibikorwa n\'ibitaramo (Failed to export events)' });
+  }
+});
+
+// Backward-compatible Member List CSV Export
+app.get('/api/admin/members/export', requireAdmin, (req: AuthRequest, res: express.Response) => {
+  try {
+    const { headers, rows, filename } = getMembersData(req.query);
+    streamCsvResponse(res, filename, headers, rows);
+  } catch (err: any) {
+    console.error('Members CSV export stream error:', err);
+    res.status(500).json({ error: err.message || 'Failed to export members CSV' });
+  }
+});
+
+// Backward-compatible Events CSV Export
+app.get('/api/admin/events/export', requireAdmin, (req: AuthRequest, res: express.Response) => {
+  try {
+    const { headers, rows, filename } = getEventsData(req.query);
+    streamCsvResponse(res, filename, headers, rows);
+  } catch (err: any) {
+    console.error('Events CSV export stream error:', err);
+    res.status(500).json({ error: err.message || 'Failed to export events CSV' });
+  }
+});
+
+app.use('/api/admin/export', exportRouter);
+
+// Member Activity Log (Last 10 user actions)
+app.get('/api/admin/member-activity-logs', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const limit = Number(req.query.limit) || 10;
+    const logs = db.prepare(`
+      SELECT al.*, u.avatar_url, u.email as user_email
+      FROM activity_logs al
+      LEFT JOIN users u ON al.user_id = u.id
+      ORDER BY al.created_at DESC
+      LIMIT ?
+    `).all(limit);
+
+    res.json(logs);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch member activity logs' });
+  }
+});
+
+// Admin User Creation with Bcrypt Password Hashing
+app.post('/api/admin/users', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { name, email, password, role, phone } = req.body;
+    if (!name || !email || !password) {
+      return res.status(400).json({ error: 'Amazina, imeli n\'ijambo ry\'ibanga birakenewe (Name, email, and password required)' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ error: 'Ijambo ry\'ibanga rigomba kugira byibuze inyuguti 6 (Password must be at least 6 characters)' });
+    }
+
+    const cleanEmail = String(email).trim().toLowerCase();
+    const existing = db.prepare('SELECT id FROM users WHERE LOWER(TRIM(email)) = ?').get(cleanEmail);
+    if (existing) {
+      return res.status(409).json({ error: 'Iyi imeli isanzwe ikoreshwa (Email already registered)' });
+    }
+
+    const validRoles = ['super_admin', 'admin', 'content_admin', 'moderator', 'normal_user', 'member', 'supporter'];
+    const selectedRole = role && validRoles.includes(role) ? role : 'supporter';
+
+    // Only super_admin can create super_admin or admin accounts
+    if ((selectedRole === 'super_admin' || selectedRole === 'admin') && req.user!.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Super Admin gusa ni we ushobora guha undi umwanya wa Admin cyangwa Super Admin' });
+    }
+
+    const newUserId = `usr_${Date.now()}`;
+    const passwordHash = hashPassword(password);
+
+    db.prepare(`
+      INSERT INTO users (id, name, email, password_hash, phone, role, is_disabled)
+      VALUES (?, ?, ?, ?, ?, ?, 0)
+    `).run(newUserId, name.trim(), cleanEmail, passwordHash, phone?.trim() || null, selectedRole);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'CREATE_USER',
+      'users',
+      newUserId,
+      `Created user ${cleanEmail} with role ${selectedRole} using bcrypt password hashing`
+    );
+
+    res.status(201).json({
+      message: 'Umukoresha yongewemo neza',
+      user: {
+        id: newUserId,
+        name: name.trim(),
+        email: cleanEmail,
+        role: selectedRole,
+        phone: phone?.trim() || ''
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to create user' });
+  }
+});
+
+// Admin Password Reset with Bcrypt Password Hashing
+app.post('/api/admin/users/:id/reset-password', requireSuperAdmin, (req: AuthRequest, res) => {
+  try {
+    const { id } = req.params;
+    const { new_password } = req.body;
+
+    if (!new_password || typeof new_password !== 'string' || new_password.length < 6) {
+      return res.status(400).json({ error: 'Ijambo ry\'ibanga rigomba kugira byibuze inyuguti 6 (Password must be at least 6 characters)' });
+    }
+
+    const user = db.prepare('SELECT id, name, email FROM users WHERE id = ?').get(id) as any;
+    if (!user) {
+      return res.status(404).json({ error: 'Umukoresha ntabonetse (User not found)' });
+    }
+
+    const newHash = hashPassword(new_password);
+    db.prepare('UPDATE users SET password_hash = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?').run(newHash, id);
+
+    logActivity(
+      req.user!.id,
+      req.user!.name,
+      req.user!.role,
+      'RESET_PASSWORD',
+      'users',
+      id,
+      `Reset password for user ${user.email} using bcrypt password hashing`
+    );
+
+    res.json({ message: `Ijambobanga rya ${user.name} ryahinduwe neza (Bcrypt hash updated)` });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to reset password' });
+  }
+});
+
+// -------------------------------------------------------------
+// SECURE, READ-ONLY IMMUTABLE ACTIVITY AUDIT LOGS
+// -------------------------------------------------------------
+
+// Detailed Stats for Admin Audit Log Dashboard
+app.get('/api/admin/activity-logs/stats', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const totalCount = (db.prepare('SELECT COUNT(*) as count FROM activity_logs').get() as any)?.count || 0;
+
+    const songEditsCount = (db.prepare(`
+      SELECT COUNT(*) as count FROM activity_logs 
+      WHERE action IN ('MANUAL_SONG_EDIT', 'UPDATE_SONG', 'CREATE_SONG', 'DELETE_SONG', 'RESTORE_SONG', 'STATUS_CHANGE', 'RELEASE_STATUS_CHANGE')
+    `).get() as any)?.count || 0;
+
+    const userActionsCount = (db.prepare(`
+      SELECT COUNT(*) as count FROM activity_logs 
+      WHERE action IN ('BULK_USER_REMOVAL', 'BULK_USER_DELETE', 'BULK_USER_DISABLE', 'CHANGE_USER_ROLE', 'CHANGE_USER_STATUS', 'BLOCK_USER', 'DELETE_USER', 'ACCOUNT_DELETED')
+    `).get() as any)?.count || 0;
+
+    const exportActionsCount = (db.prepare(`
+      SELECT COUNT(*) as count FROM activity_logs 
+      WHERE action IN ('CSV_EXPORT', 'EXPORT')
+    `).get() as any)?.count || 0;
+
+    const last24hCount = (db.prepare(`
+      SELECT COUNT(*) as count FROM activity_logs 
+      WHERE created_at >= datetime('now', '-24 hours')
+    `).get() as any)?.count || 0;
+
+    const topActors = db.prepare(`
+      SELECT user_name, user_role, COUNT(*) as action_count
+      FROM activity_logs
+      GROUP BY user_name, user_role
+      ORDER BY action_count DESC
+      LIMIT 5
+    `).all() as any[];
+
+    res.json({
+      totalCount,
+      songEditsCount,
+      userActionsCount,
+      exportActionsCount,
+      last24hCount,
+      topActors
+    });
+  } catch (err: any) {
+    console.error('Failed to fetch activity logs stats:', err);
+    res.status(500).json({ error: 'Failed to fetch audit log stats' });
+  }
+});
+
+app.get('/api/admin/activity-logs', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { resource, action, category, search, date_from, date_to, limit = 100, offset = 0 } = req.query;
+    let query = `SELECT * FROM activity_logs WHERE 1=1`;
+    const params: any[] = [];
+
+    if (category && category !== 'all') {
+      const cat = String(category).toLowerCase();
+      if (cat === 'songs' || cat === 'song_edits') {
+        query += ` AND (action IN ('MANUAL_SONG_EDIT', 'UPDATE_SONG', 'CREATE_SONG', 'DELETE_SONG', 'RESTORE_SONG', 'STATUS_CHANGE', 'RELEASE_STATUS_CHANGE', 'ADD_AUDIO_TRACK', 'DELETE_AUDIO') OR resource = 'songs')`;
+      } else if (cat === 'users' || cat === 'user_removals') {
+        query += ` AND (action IN ('BULK_USER_REMOVAL', 'BULK_USER_DELETE', 'BULK_USER_DISABLE', 'CHANGE_USER_ROLE', 'CHANGE_USER_STATUS', 'BLOCK_USER', 'DELETE_USER', 'RESET_PASSWORD', 'ACCOUNT_DELETED') OR resource = 'users')`;
+      } else if (cat === 'export' || cat === 'exports') {
+        query += ` AND (action = 'CSV_EXPORT' OR resource = 'export')`;
+      } else if (cat === 'auth' || cat === 'logins') {
+        query += ` AND (action IN ('USER_LOGIN', 'ADMIN_LOGIN', 'LOGOUT') OR resource = 'auth')`;
+      } else if (cat === 'content') {
+        query += ` AND (action LIKE '%ANNOUNCEMENT%' OR action LIKE '%ARTICLE%' OR action LIKE '%EVENT%' OR resource IN ('announcements', 'events', 'content_articles'))`;
+      }
+    }
+
+    if (resource && resource !== 'all') {
+      query += ` AND resource = ?`;
+      params.push(resource);
+    }
+
+    if (action && action !== 'all') {
+      query += ` AND action = ?`;
+      params.push(action);
+    }
+
+    if (date_from) {
+      query += ` AND created_at >= ?`;
+      params.push(date_from);
+    }
+
+    if (date_to) {
+      query += ` AND created_at <= ?`;
+      params.push(date_to + ' 23:59:59');
+    }
+
+    if (search && typeof search === 'string' && search.trim()) {
+      const term = `%${search.trim()}%`;
+      query += ` AND (details LIKE ? OR user_name LIKE ? OR action LIKE ? OR resource LIKE ? OR id LIKE ?)`;
+      params.push(term, term, term, term, term);
+    }
+
+    // Clone for count before limit
+    const countQuery = query.replace('SELECT *', 'SELECT COUNT(*) as count');
+    const totalMatching = (db.prepare(countQuery).get(...params) as any)?.count || 0;
+
+    query += ` ORDER BY created_at DESC LIMIT ? OFFSET ?`;
+    params.push(Number(limit) || 100, Number(offset) || 0);
+
+    const logs = db.prepare(query).all(...params);
+    res.setHeader('X-Total-Count', String(totalMatching));
+
+    if (req.query.format === 'envelope') {
+      res.json({ logs, total: totalMatching, limit: Number(limit) || 100, offset: Number(offset) || 0 });
+    } else {
+      res.json(logs);
+    }
+  } catch (err: any) {
+    console.error('Failed to fetch activity logs:', err);
+    res.status(500).json({ error: 'Failed to fetch activity logs' });
+  }
+});
+
+// Explicitly protect audit logs from tampering (Immutable Security Ledger)
+app.all(['/api/admin/activity-logs', '/api/admin/activity-logs/*'], (req, res, next) => {
+  if (['DELETE', 'PUT', 'PATCH', 'POST'].includes(req.method)) {
+    return res.status(405).json({
+      error: 'Audit logs are immutable. Deletion or modification of administrative security records is strictly forbidden.'
+    });
+  }
+  next();
+});
+
+// Admin Donations Dashboard & CSV Export
+app.get('/api/admin/donations', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { status, provider, date_from, date_to } = req.query;
+    let query = `
+      SELECT pt.*, u.email as user_email
+      FROM payment_transactions pt
+      LEFT JOIN users u ON pt.user_id = u.id
+      WHERE 1=1
+    `;
+    const params: any[] = [];
+
+    if (status && status !== 'all') {
+      query += ` AND pt.status = ?`;
+      params.push(status);
+    }
+    if (provider && provider !== 'all') {
+      query += ` AND pt.provider_slug = ?`;
+      params.push(provider);
+    }
+    if (date_from) {
+      query += ` AND pt.created_at >= ?`;
+      params.push(date_from);
+    }
+    if (date_to) {
+      query += ` AND pt.created_at <= ?`;
+      params.push(date_to);
+    }
+
+    query += ` ORDER BY pt.created_at DESC`;
+    const donations = db.prepare(query).all(...params);
+    res.json(donations);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch donations' });
+  }
+});
+
+// Backward-compatible CSV Export for donations
+app.get('/api/admin/donations/export', requireAdmin, (req: AuthRequest, res: express.Response) => {
+  try {
+    const { headers, rows, filename } = getDonationsData(req.query);
+    streamCsvResponse(res, filename, headers, rows);
+  } catch (err: any) {
+    console.error('Donations CSV export stream error:', err);
+    res.status(500).json({ error: err.message || 'Failed to export donations CSV' });
+  }
+});
+
+// Admin Branding Management
+app.put('/api/admin/branding', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const {
+      main_logo_url,
+      app_icon_url,
+      splash_logo_url,
+      light_logo_url,
+      dark_logo_url,
+      banner_image_url,
+      primary_color,
+      secondary_color,
+      accent_color,
+      background_color,
+      text_color,
+      choir_name,
+      affiliation,
+      church_affiliation,
+      about_story,
+      mission_statement,
+      mission,
+      vision_statement,
+      vision,
+      welcome_message,
+      scripture_verse,
+      songs_badge_text,
+      contact_phone,
+      contact_email
+    } = req.body;
+
+    db.prepare(`
+      UPDATE branding_settings
+      SET main_logo_url = ?, app_icon_url = ?, splash_logo_url = ?, light_logo_url = ?,
+          dark_logo_url = ?, banner_image_url = ?, primary_color = ?, secondary_color = ?,
+          accent_color = ?, background_color = ?, text_color = ?, updated_at = CURRENT_TIMESTAMP
+      WHERE id = 'default_branding'
+    `).run(
+      main_logo_url || '',
+      app_icon_url || '',
+      splash_logo_url || '',
+      light_logo_url || '',
+      dark_logo_url || '',
+      banner_image_url || '',
+      primary_color || '#1e3a8a',
+      secondary_color || '#d97706',
+      accent_color || '#2563eb',
+      background_color || '#f8fafc',
+      text_color || '#0f172a'
+    );
+
+    // Update text settings
+    const updateSetting = db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)');
+    if (choir_name !== undefined) updateSetting.run('choir_name', String(choir_name).trim());
+    if (affiliation !== undefined || church_affiliation !== undefined) updateSetting.run('church_affiliation', String(affiliation || church_affiliation).trim());
+    if (about_story !== undefined) updateSetting.run('about_story', String(about_story).trim());
+    if (mission_statement !== undefined || mission !== undefined) updateSetting.run('mission_statement', String(mission_statement || mission).trim());
+    if (vision_statement !== undefined || vision !== undefined) updateSetting.run('vision_statement', String(vision_statement || vision).trim());
+    if (welcome_message !== undefined) updateSetting.run('welcome_message', String(welcome_message).trim());
+    if (scripture_verse !== undefined) updateSetting.run('scripture_verse', String(scripture_verse).trim());
+    if (songs_badge_text !== undefined) updateSetting.run('songs_badge_text', String(songs_badge_text).trim());
+    if (contact_phone !== undefined) updateSetting.run('contact_phone', String(contact_phone).trim());
+    if (contact_email !== undefined) updateSetting.run('contact_email', String(contact_email).trim());
+
+    // Audit log
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'UPDATE_BRANDING', 'branding_settings', ?)")
+      .run('log_' + Date.now(), req.user!.id, 'Branding & logos updated');
+
+    res.json({ message: 'Ibirango n\'amabara byavuguruwe (Branding updated successfully)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update branding' });
+  }
+});
+
+// -------------------------------------------------------------
+// ADMIN CHOIR LEADERSHIP CONTACT MANAGEMENT API
+// -------------------------------------------------------------
+app.get('/api/admin/contacts', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    let contacts = db.prepare('SELECT * FROM leadership_contacts WHERE id = ?').get('default_contacts') as any;
+    if (!contacts) {
+      contacts = {
+        id: 'default_contacts',
+        leader_name: '[INSERT NAME]',
+        leader_phone: '[INSERT PHONE NUMBER]',
+        leader_whatsapp: '[INSERT WHATSAPP NUMBER]',
+        leader_title_rw: 'Umuyobozi wa Korali',
+        leader_title_en: 'Choir Leader / President',
+        secretary_name: '[INSERT NAME]',
+        secretary_phone: '[INSERT PHONE NUMBER]',
+        secretary_whatsapp: '[INSERT WHATSAPP NUMBER]',
+        secretary_title_rw: 'Umunyamabanga wa Korali',
+        secretary_title_en: 'Choir Secretary',
+        general_phone: '[INSERT PHONE NUMBER]',
+        general_whatsapp: '[INSERT WHATSAPP NUMBER]',
+        general_email: '[INSERT EMAIL ADDRESS]',
+        address: '[INSERT CHOIR ADDRESS]',
+        city: 'Kigali',
+        country: 'Rwanda',
+        weekday_range: 'Kuwa Mbere – Kuwa Gatanu (Monday–Friday)',
+        weekday_hours: '[INSERT HOURS]',
+        weekend_range: 'Kuwa Gatandatu – Ku Cyumweru (Saturday–Sunday)',
+        weekend_hours: '[INSERT HOURS]',
+        contact_description_rw: 'Ufite ikibazo, igitekerezo, cyangwa ushaka kumenya byinshi kuri La Lumiere Choir? Twandikire cyangwa utuvugishe ukoresheje bumwe mu buryo bukurikira.',
+        contact_description_en: 'Do you have questions, feedback, or need information about La Lumiere Choir? Get in touch with our leadership team using the options below.',
+      };
+    }
+    res.json(contacts);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch choir leadership contact details' });
+  }
+});
+
+app.put('/api/admin/contacts', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const {
+      leader_name,
+      leader_phone,
+      leader_whatsapp,
+      leader_title_rw,
+      leader_title_en,
+      secretary_name,
+      secretary_phone,
+      secretary_whatsapp,
+      secretary_title_rw,
+      secretary_title_en,
+      general_phone,
+      general_whatsapp,
+      general_email,
+      address,
+      city,
+      country,
+      weekday_range,
+      weekday_hours,
+      weekend_range,
+      weekend_hours,
+      contact_description_rw,
+      contact_description_en
+    } = req.body;
+
+    // Strict validation for required fields
+    if (!leader_name?.trim()) {
+      return res.status(400).json({ error: 'Izina ry\'Umuyobozi wa Korali rirakenewe (Leader name required)' });
+    }
+    if (!leader_phone?.trim()) {
+      return res.status(400).json({ error: 'Nimero ya telefone y\'Umuyobozi irakenewe (Leader phone required)' });
+    }
+    if (!secretary_name?.trim()) {
+      return res.status(400).json({ error: 'Izina ry\'Umunyamabanga rirakenewe (Secretary name required)' });
+    }
+    if (!secretary_phone?.trim()) {
+      return res.status(400).json({ error: 'Nimero ya telefone y\'Umunyamabanga irakenewe (Secretary phone required)' });
+    }
+    if (!general_phone?.trim()) {
+      return res.status(400).json({ error: 'Telefone rusange ya korali irakenewe (General choir phone required)' });
+    }
+    if (!general_email?.trim()) {
+      return res.status(400).json({ error: 'Imeli rusange ya korali irakenewe (General choir email required)' });
+    }
+    if (!address?.trim()) {
+      return res.status(400).json({ error: 'Aderesi cyangwa icyicaro cya korali birakenewe (Address required)' });
+    }
+
+    // Email format check
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    const cleanEmail = general_email.trim();
+    if (!cleanEmail.includes('[INSERT') && !emailRegex.test(cleanEmail)) {
+      return res.status(400).json({ error: 'Imeli yanditse nabi. Urugero: info@lalumierechoir.rw (Invalid email format)' });
+    }
+
+    // Insert or replace in leadership_contacts
+    db.prepare(`
+      INSERT INTO leadership_contacts (
+        id,
+        leader_name, leader_phone, leader_whatsapp, leader_title_rw, leader_title_en,
+        secretary_name, secretary_phone, secretary_whatsapp, secretary_title_rw, secretary_title_en,
+        general_phone, general_whatsapp, general_email,
+        address, city, country,
+        weekday_range, weekday_hours, weekend_range, weekend_hours,
+        contact_description_rw, contact_description_en,
+        updated_at, updated_by
+      ) VALUES (
+        'default_contacts',
+        ?, ?, ?, ?, ?,
+        ?, ?, ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?,
+        ?, ?, ?, ?,
+        ?, ?,
+        CURRENT_TIMESTAMP, ?
+      )
+      ON CONFLICT(id) DO UPDATE SET
+        leader_name = excluded.leader_name,
+        leader_phone = excluded.leader_phone,
+        leader_whatsapp = excluded.leader_whatsapp,
+        leader_title_rw = excluded.leader_title_rw,
+        leader_title_en = excluded.leader_title_en,
+        secretary_name = excluded.secretary_name,
+        secretary_phone = excluded.secretary_phone,
+        secretary_whatsapp = excluded.secretary_whatsapp,
+        secretary_title_rw = excluded.secretary_title_rw,
+        secretary_title_en = excluded.secretary_title_en,
+        general_phone = excluded.general_phone,
+        general_whatsapp = excluded.general_whatsapp,
+        general_email = excluded.general_email,
+        address = excluded.address,
+        city = excluded.city,
+        country = excluded.country,
+        weekday_range = excluded.weekday_range,
+        weekday_hours = excluded.weekday_hours,
+        weekend_range = excluded.weekend_range,
+        weekend_hours = excluded.weekend_hours,
+        contact_description_rw = excluded.contact_description_rw,
+        contact_description_en = excluded.contact_description_en,
+        updated_at = CURRENT_TIMESTAMP,
+        updated_by = excluded.updated_by
+    `).run(
+      leader_name.trim(),
+      leader_phone.trim(),
+      leader_whatsapp?.trim() || leader_phone.trim(),
+      leader_title_rw?.trim() || 'Umuyobozi wa Korali',
+      leader_title_en?.trim() || 'Choir Leader / President',
+      secretary_name.trim(),
+      secretary_phone.trim(),
+      secretary_whatsapp?.trim() || secretary_phone.trim(),
+      secretary_title_rw?.trim() || 'Umunyamabanga wa Korali',
+      secretary_title_en?.trim() || 'Choir Secretary',
+      general_phone.trim(),
+      general_whatsapp?.trim() || general_phone.trim(),
+      cleanEmail,
+      address.trim(),
+      city?.trim() || 'Kigali',
+      country?.trim() || 'Rwanda',
+      weekday_range?.trim() || 'Kuwa Mbere – Kuwa Gatanu (Monday–Friday)',
+      weekday_hours?.trim() || '[INSERT HOURS]',
+      weekend_range?.trim() || 'Kuwa Gatandatu – Ku Cyumweru (Saturday–Sunday)',
+      weekend_hours?.trim() || '[INSERT HOURS]',
+      contact_description_rw?.trim() || '',
+      contact_description_en?.trim() || '',
+      req.user!.id
+    );
+
+    // Synchronize contact_phone and contact_email in app_settings as well for backward compatibility
+    const upsertSetting = db.prepare('INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)');
+    upsertSetting.run('contact_phone', general_phone.trim());
+    upsertSetting.run('contact_email', cleanEmail);
+
+    // Audit log
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'UPDATE_CONTACT_INFO', 'leadership_contacts', ?)")
+      .run('log_' + Date.now(), req.user!.id, `Choir leadership contact information updated by ${req.user!.name}`);
+
+    res.json({
+      message: 'Amakuru yo kuvugisha ubuyobozi yabitswe neza (Contact information updated successfully)',
+      success: true
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to update contact information' });
+  }
+});
+
+// Admin Payment Settings & Providers
+app.get('/api/admin/payment-providers', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const providers = db.prepare('SELECT * FROM payment_providers').all();
+    res.json(providers);
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch payment providers' });
+  }
+});
+
+app.get('/api/admin/payment-settings', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const providers = db.prepare('SELECT * FROM payment_providers').all();
+    res.json({
+      providers,
+      env: {
+        mtn_configured: Boolean(process.env.MTN_MOMO_SUBSCRIPTION_KEY),
+        airtel_configured: Boolean(process.env.AIRTEL_MONEY_CLIENT_ID)
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch payment settings' });
+  }
+});
+
+app.put('/api/admin/payment-settings', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { providers } = req.body;
+    if (Array.isArray(providers)) {
+      const updateProv = db.prepare(`
+        UPDATE payment_providers
+        SET is_enabled = ?, environment = ?, api_endpoint = ?, merchant_account_id = ?, updated_at = CURRENT_TIMESTAMP
+        WHERE slug = ?
+      `);
+      providers.forEach(p => {
+        updateProv.run(p.is_enabled ? 1 : 0, p.environment || 'sandbox', p.api_endpoint || null, p.merchant_account_id || null, p.slug);
+      });
+    }
+
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'UPDATE_PAYMENT_CONFIG', 'payment_providers', ?)")
+      .run('log_' + Date.now(), req.user!.id, 'Payment provider configurations updated');
+
+    res.json({ message: 'Amakuru yo kwishyura yavuguruwe (Payment settings updated)' });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to update payment settings' });
+  }
+});
+
+// Admin Donation Recipient & Gateway Settings
+app.get('/api/admin/donation-settings', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const settings = getMomoDonationSettings();
+    const gateway = RwandaPaymentGatewayService.getGatewayStatus();
+    res.json({
+      settings,
+      gateway,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to fetch admin donation settings' });
+  }
+});
+
+app.put('/api/admin/donation-settings', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const updates = req.body;
+    const updated = updateMomoDonationSettings(updates, req.user!.id);
+
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'UPDATE_DONATION_SETTINGS', 'momo_donation_settings', ?)")
+      .run(`log_${Date.now()}`, req.user!.id, `Updated donation recipient to ${updated.recipient_name} (${updated.phone_number})`);
+
+    res.json({
+      message: 'Amakuru yo kwakira impano yavuguruwe neza (Donation settings saved successfully)',
+      settings: updated,
+      gateway: RwandaPaymentGatewayService.getGatewayStatus(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to update donation settings' });
+  }
+});
+
+app.get('/api/admin/donations/:id', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const tx = db.prepare(`
+      SELECT pt.*, u.email as user_email, u.name as user_display_name
+      FROM payment_transactions pt
+      LEFT JOIN users u ON pt.user_id = u.id
+      WHERE pt.id = ? OR pt.internal_reference = ?
+    `).get(req.params.id, req.params.id) as any;
+
+    if (!tx) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    let safeMetadata = null;
+    if (tx.gateway_metadata) {
+      try {
+        safeMetadata = JSON.parse(tx.gateway_metadata);
+      } catch {
+        safeMetadata = null;
+      }
+    }
+
+    res.json({
+      ...tx,
+      gateway_metadata: safeMetadata,
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Failed to load transaction details' });
+  }
+});
+
+app.post('/api/admin/donations/:id/verify', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    const transaction = await RwandaPaymentGatewayService.verifyPaymentStatus(req.params.id);
+    broadcastRealtimeEvent('donation_updated', {
+      transaction,
+      type: 'ADMIN_VERIFY',
+    });
+    res.json({
+      message: 'Transaction status synchronized with payment gateway',
+      transaction,
+    });
+  } catch (err: any) {
+    res.status(400).json({ error: err.message || 'Failed to verify transaction status' });
+  }
+});
+
+app.post('/api/admin/donations/:id/refund', requireAdmin, async (req: AuthRequest, res) => {
+  try {
+    const tx = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(req.params.id) as any;
+    if (!tx) {
+      return res.status(404).json({ error: 'Transaction not found' });
+    }
+
+    if (tx.status !== 'successful') {
+      return res.status(400).json({ error: 'Only successful donations can be refunded' });
+    }
+
+    const gateway = RwandaPaymentGatewayService.getGatewayStatus();
+    if (!gateway.supports_refunds) {
+      return res.status(400).json({
+        error: 'Uburyo bwo gusubiza amafaranga (Refund) ntibushyigikiwe na gateway ikoreshwa muri iki gihe. Nyamuneka koresha MTN/Airtel merchant portal.',
+      });
+    }
+
+    db.prepare(`
+      UPDATE payment_transactions
+      SET status = 'cancelled', failure_reason = 'Refunded by administrator', updated_at = CURRENT_TIMESTAMP
+      WHERE id = ?
+    `).run(tx.id);
+
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'DONATION_REFUNDED', 'payment_transactions', ?)")
+      .run(`log_${Date.now()}`, req.user!.id, `Refunded donation ${tx.internal_reference} of ${tx.amount} RWF`);
+
+    const updated = db.prepare('SELECT * FROM payment_transactions WHERE id = ?').get(tx.id);
+    broadcastRealtimeEvent('donation_updated', { transaction: updated, type: 'REFUNDED' });
+
+    res.json({ message: 'Ubusabe bwo gusubiza amafaranga bwemejwe', transaction: updated });
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to process refund' });
+  }
+});
+
+// Admin File Uploads handled by handleUnifiedImageUpload above
+
+// -------------------------------------------------------------
+// LA LUMIERE AI ASSISTANT API ROUTER & ENDPOINTS
+// -------------------------------------------------------------
+app.use('/api/ai', aiRouter);
+
+
+// 3. Admin settings update for AI assistant
+app.put('/api/admin/ai/settings', requireAdmin, (req: AuthRequest, res) => {
+  try {
+    const { enabled, model } = req.body;
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'Enabled must be a boolean' });
+    }
+
+    updateAiAssistantConfig(enabled, model);
+
+    // Audit log
+    db.prepare("INSERT INTO audit_logs (id, user_id, action, resource, details) VALUES (?, ?, 'UPDATE_AI_SETTINGS', 'ai_assistant', ?)")
+      .run('log_' + Date.now(), req.user!.id, `AI Assistant set to enabled=${enabled}, model=${model || 'default'}`);
+
+    res.json({
+      success: true,
+      message: 'Igenamiterere rya AI Assistant ryahinduwe neza (AI settings updated successfully)',
+      config: getAiAssistantConfig(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: 'Failed to update AI assistant settings' });
+  }
+});
+
+// -------------------------------------------------------------
+// API 404 & ERROR HANDLING (Guarantees valid JSON responses)
+// -------------------------------------------------------------
+app.all('/api/*', (req, res) => {
+  res.setHeader('Content-Type', 'application/json');
+  return res.status(404).json({
+    success: false,
+    message: `API endpoint ${req.method} ${req.originalUrl} not found`,
+    error: `API endpoint ${req.method} ${req.originalUrl} not found`
+  });
+});
+
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Unhandled server error:', err);
+  if (req.path && req.path.startsWith('/api')) {
+    res.setHeader('Content-Type', 'application/json');
+    return res.status(err.status || 500).json({
+      success: false,
+      message: err.message || 'Habaye ikosa kuri seriveri (Internal server error)',
+      error: err.message || 'Internal server error'
+    });
+  }
+  next(err);
+});
+
+// -------------------------------------------------------------
+// VITE MIDDLEWARE & SPA SERVING
+// -------------------------------------------------------------
+async function startServer() {
+  // Initialize the first admin account hash if it does not already exist in the database
+  try {
+    const adminInitResult = await setupFirstAdminAccount();
+    console.log(`[Admin Account Setup] ${adminInitResult.message}`);
+  } catch (initErr) {
+    console.warn('[Admin Account Setup Error] Failed during startup setup:', initErr);
+  }
+
+  const server = http.createServer(app);
+
+  if (process.env.NODE_ENV !== 'production') {
+    const vite = await createViteServer({
+      server: {
+        middlewareMode: true,
+        ws: {
+          server,
+        },
+      },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+
+    // Explicit fallback for client-side routing in dev to ensure index.html
+    // is always processed through vite.transformIndexHtml with React refresh preamble
+    app.use('*', async (req, res, next) => {
+      const url = req.originalUrl;
+      // Skip API and static asset requests that were not matched
+      if (url.startsWith('/api') || url.startsWith('/uploads') || url.includes('.')) {
+        return next();
+      }
+      try {
+        const indexPath = path.resolve(process.cwd(), 'index.html');
+        let template = fs.readFileSync(indexPath, 'utf-8');
+        template = await vite.transformIndexHtml(url, template);
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(template);
+      } catch (e) {
+        vite.ssrFixStacktrace(e as Error);
+        next(e);
+      }
+    });
+  } else {
+    const distPath = path.join(process.cwd(), 'dist');
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('sw.js') || filePath.includes('workbox-')) {
+            res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            res.setHeader('Service-Worker-Allowed', '/');
+          } else if (filePath.endsWith('.html')) {
+            res.setHeader('Cache-Control', 'no-cache');
+          } else if (filePath.includes('/assets/')) {
+            res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+          }
+        },
+      })
+    );
+    app.get('*', (req, res) => {
+      if (req.originalUrl.startsWith('/api') || req.originalUrl.startsWith('/uploads')) {
+        return res.status(404).json({ error: 'Endpoint not found' });
+      }
+      res.setHeader('Cache-Control', 'no-cache');
+      res.sendFile(path.join(distPath, 'index.html'));
+    });
+  }
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log(`La Lumiere Choir App running at http://0.0.0.0:${PORT}`);
+    startReminderScheduler();
+  });
+
+  server.on('error', (err: any) => {
+    if (err && err.code === 'EADDRINUSE') {
+      console.warn(`[Server] Port ${PORT} is temporarily in use. Waiting to retry...`);
+      setTimeout(() => {
+        try {
+          server.close();
+        } catch {
+          // ignore close error
+        }
+        server.listen(PORT, '0.0.0.0');
+      }, 1000);
+    } else {
+      console.error('[Server] Listen error:', err);
+    }
+  });
+
+  const handleShutdown = () => {
+    try {
+      server.close(() => {
+        process.exit(0);
+      });
+    } catch {
+      process.exit(0);
+    }
+  };
+
+  process.on('SIGTERM', handleShutdown);
+  process.on('SIGINT', handleShutdown);
+}
+
+startServer().catch(err => {
+  console.error('Failed to start server:', err);
+});
